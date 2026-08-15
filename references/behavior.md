@@ -21,11 +21,9 @@ In projects, `AGENTS.md` is canonical and `CLAUDE.md` is a relative symlink to i
 
 Accept local paths, GitHub/GitLab repositories and tree URLs, arbitrary git URLs supported by `npx skills`, direct skill/archive URLs, `skills.sh/<owner>/<repo>/<skill>`, and allowlisted `npx skills add ...` commands. Local sources copy by default; link only when explicitly requested.
 
-Record original source, resolved name, scope, timestamp, and bindings. Same name with different source or content is a conflict; ask before replacing or aliasing.
-
 ## MCP
 
-Default source and scope are `auto`. In a project prefer `.mcp.json`, then `.opencode/opencode.json`; outside a project prefer a supported global JSON config. Never silently change project/global scope.
+Default source and scope are `auto`. Sources may be Codex or Grok TOML; Claude, OpenCode, or Gemini JSON; Hermes or Goose YAML; or an explicit path. Prefer project sources, then global sources. Never silently change project/global scope.
 
 Preserve secrets. Before writing a project file containing likely secret literals, prove the file is gitignored. Otherwise block apply. Never print secret values; report keys only.
 

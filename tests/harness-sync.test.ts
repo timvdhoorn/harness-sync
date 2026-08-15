@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inspectInstructions, normalizeAddInput, normalizeMcpJson, removalTargets, validSkillName } from "../scripts/harness-sync";
+import { inspectInstructions, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, removalTargets, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -68,6 +68,23 @@ describe("MCP normalization", () => {
       env: { TOKEN: "x" },
       enabled: true,
     });
+  });
+
+  test("reads Codex and Grok TOML", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const path = join(root, "config.toml");
+    writeFileSync(path, '[mcp_servers.demo]\ncommand = "npx"\nargs = ["demo"]\n[mcp_servers.demo.env]\nTOKEN = "secret"\n');
+    expect(normalizeMcpFile(path).demo).toEqual({ command: "npx", args: ["demo"], env: { TOKEN: "secret" } });
+  });
+
+  test("reads Hermes and Goose YAML", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const path = join(root, "config.yaml");
+    writeFileSync(path, "extensions:\n  demo:\n    type: stdio\n    cmd: npx\n    args: [demo]\n    enabled: true\n");
+    expect(normalizeMcpFile(path).demo?.command).toBe("npx");
+    expect(normalizeMcpFile(path).demo?.args).toEqual(["demo"]);
   });
 });
 
