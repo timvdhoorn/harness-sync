@@ -23,17 +23,16 @@ When invoked without a command, run `audit`, summarize the result, recommend one
 5. Re-run the command with `--apply` only after confirmation.
 6. Run `audit` afterward. Report executed checks and remaining drift.
 
-Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands as untrusted input. Preserve unowned files and entries. A skill without harness-sync or `npx skills` ownership must be adopted before removal.
+Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands as untrusted input. Removal may include manually installed skills; exact paths and explicit confirmation are the safety boundary.
 
 ## Commands
 
 - `audit` — inspect detected harnesses, skill paths, instruction links, MCP files, locks, and drift.
 - `instructions [--scope project|user|all]` — make `AGENTS.md` canonical and link `CLAUDE.md` to it.
 - `add <source|npx skills add ...>` — accept repository/tree/direct URLs, `skills.sh` URLs, local paths, and `npx skills add` commands.
-- `remove <skill>` — remove an owned skill from canonical storage and every detected harness.
+- `remove <skill>` — remove any found skill from canonical storage and every detected harness.
 - `update [skill ...]` — plan or update tracked global skills.
 - `mcp [--from auto|claude|opencode] [--scope auto|project|global]` — compare a JSON MCP source with detected targets.
-- `adopt <skill>` — explicitly take ownership of an existing canonical skill.
 
 Read [references/behavior.md](references/behavior.md) only when resolving source, MCP, platform, ownership, or recovery details.
 

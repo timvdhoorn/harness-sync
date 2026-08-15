@@ -357,24 +357,16 @@ function npxLockOwns(name: string): boolean {
   return false;
 }
 
-function adopt(name: string, apply: boolean): void {
-  if (!validSkillName(name)) fail("invalid skill name");
-  const path = join(canonicalSkills, name);
-  if (!existsSync(join(path, "SKILL.md"))) fail(`canonical skill missing: ${path}`);
-  console.log(`Plan: adopt ${name} at ${path}`);
-  if (!apply) return;
-  const ledger = loadLedger();
-  ledger.skills[name] = { source: path, adopted: true, installedAt: new Date().toISOString() };
-  saveLedger(ledger);
-  console.log(`Adopted ${name}`);
+export function removalTargets(name: string, skillDirs = [canonicalSkills, ...harnesses.map((item) => item.skillDir)]): string[] {
+  return [...new Set(skillDirs.map((directory) => join(directory, name)))].filter(pathExists);
 }
 
 function removeSkill(name: string, args: string[]): void {
   const apply = applyRequired(args);
   if (!validSkillName(name)) fail("invalid skill name");
   const ledger = loadLedger();
-  if (!ledger.skills[name] && !npxLockOwns(name)) fail(`${name} is unowned; run adopt first`);
-  const targets = [join(canonicalSkills, name), ...harnesses.map((item) => join(item.skillDir, name))].filter(existsSync);
+  const targets = removalTargets(name);
+  if (!targets.length) fail(`skill not found: ${name}`);
   console.log(`Plan: remove ${name} from ${targets.length} path(s):\n${targets.join("\n")}`);
   if (!apply) return;
   const backupRoot = backup([ledgerPath, ...targets, join(home, ".agents", ".skill-lock.json"), join(cwd, "skills-lock.json")]);
@@ -482,7 +474,7 @@ function mcpSync(args: string[]): void {
 }
 
 function usage(): void {
-  console.log(`harness-sync [audit|instructions|add|remove|update|mcp|adopt]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
+  console.log(`harness-sync [audit|instructions|add|remove|update|mcp]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
 }
 
 export function main(argv = process.argv.slice(2)): void {
@@ -495,7 +487,6 @@ export function main(argv = process.argv.slice(2)): void {
     if (command === "remove") return removeSkill(args[0] ?? "", args.slice(1));
     if (command === "update") return updateSkills(args, args);
     if (command === "mcp") return mcpSync(args);
-    if (command === "adopt") return adopt(args[0] ?? "", applyRequired(args.slice(1)));
     usage();
     fail(`unknown command: ${command}`);
   } catch (error) {

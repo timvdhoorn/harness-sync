@@ -3,7 +3,7 @@
 ## State and recovery
 
 - Canonical skills: `~/.agents/skills`.
-- Ownership ledger: `${XDG_STATE_HOME:-~/.local/state}/harness-sync/ledger.json`.
+- Installation ledger: `${XDG_STATE_HOME:-~/.local/state}/harness-sync/ledger.json`; provenance only, never a removal gate.
 - Backups: `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/<timestamp>`; directory mode `0700`, files `0600`.
 - `npx skills` locks remain evidence, not desired state.
 - Back up every affected path before mutation. Restore automatically when apply fails.

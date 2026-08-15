@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inspectInstructions, normalizeAddInput, normalizeMcpJson, validSkillName } from "../scripts/harness-sync";
+import { inspectInstructions, normalizeAddInput, normalizeMcpJson, removalTargets, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -34,6 +34,16 @@ describe("skill names", () => {
     expect(validSkillName("harness-sync")).toBeTrue();
     expect(validSkillName("../escape")).toBeFalse();
     expect(validSkillName("Harness-Sync")).toBeFalse();
+  });
+});
+
+describe("skill removal", () => {
+  test("finds manually installed skills without ownership metadata", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const skill = join(root, "manual-skill");
+    writeFileSync(skill, "manual");
+    expect(removalTargets("manual-skill", [root])).toEqual([skill]);
   });
 });
 
