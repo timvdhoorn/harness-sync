@@ -11,7 +11,7 @@
 
 Detect Codex, Claude Code, Pi, Grok, OpenCode, Gemini, Hermes, and Goose. Mutate only installed harnesses. A config directory without its executable is audit-only. OMP is outside scope.
 
-Prefer native MCP CLIs. Write native config directly only for formats implemented by the CLI. Unknown versions and schemas remain audit-only.
+Use native MCP CLIs for Claude, Grok, and Gemini. Render Codex TOML, OpenCode JSON, Hermes YAML, and Goose YAML while preserving unrelated config. Detect OpenCode stable and v2 shapes separately.
 
 ## Instruction files
 
@@ -23,10 +23,10 @@ Accept local paths, GitHub/GitLab repositories and tree URLs, arbitrary git URLs
 
 ## MCP
 
-Default source and scope are `auto`. Sources may be Codex or Grok TOML; Claude, OpenCode, or Gemini JSON; Hermes or Goose YAML; or an explicit path. Prefer project sources, then global sources. Never silently change project/global scope.
+Default source and scope are `auto`. Sources may be Codex or Grok TOML; Claude, OpenCode, or Gemini JSON/JSONC; Hermes or Goose YAML; or an explicit path. Prefer project sources, then global sources. Infer an explicit path inside the Git root as project scope. Never silently change project/global scope. Hermes and Goose have no native project scope; report that limitation instead of writing globally.
 
 Preserve secrets. Before writing a project file containing likely secret literals, prove the file is gitignored. Otherwise block apply. Never print secret values; report keys only.
 
-Compare normalized transport, command, arguments, URL, environment keys, header keys, and enabled state. Same server name with a different definition is a conflict requiring confirmation.
+Compare normalized transport, command, arguments, working directory, URL, environment, headers, and enabled state. Skip identical definitions. Same name with different semantics is a conflict requiring confirmation.
 
-Use `mcp --target <claude|grok|gemini> --server <name>` after resolving one conflict. JSON sources can render missing entries through proven native CLIs; unsupported targets remain audit-only.
+Use `mcp --target <codex|claude|grok|opencode|gemini|hermes|goose> --server <name>` to narrow a plan. Only installed targets are mutable.

@@ -23,6 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 export type McpServer = {
   command?: string;
   args?: string[];
+  cwd?: string;
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
@@ -39,6 +40,7 @@ type Harness = {
 };
 
 type McpSource = { harness: string; path: string; scope: "project" | "global" };
+type SkillIssue = { path: string; issue: string };
 
 const home = homedir();
 const stateRoot = process.env.XDG_STATE_HOME
@@ -89,6 +91,14 @@ function writeJsonAtomic(path: string, value: unknown): void {
   chmodSync(path, 0o600);
 }
 
+function writeTextAtomic(path: string, value: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.harness-sync-${process.pid}`;
+  writeFileSync(temp, value, { mode: 0o600 });
+  renameSync(temp, path);
+  chmodSync(path, 0o600);
+}
+
 function timestamp(): string {
   return new Date().toISOString().replaceAll(":", "-");
 }
@@ -132,6 +142,33 @@ function cleanOldBackups(): void {
   for (const stale of entries.slice(10)) rmSync(join(root, stale), { recursive: true, force: true });
 }
 
+function hashTree(path: string): string {
+  const hash = createHash("sha256");
+  const visit = (current: string, prefix: string) => {
+    for (const name of readdirSync(current).sort()) {
+      const child = join(current, name);
+      const item = lstatSync(child);
+      hash.update(`${prefix}${name}:${item.isDirectory() ? "d" : item.isSymbolicLink() ? "l" : "f"}\0`);
+      if (item.isDirectory()) visit(child, `${prefix}${name}/`);
+      else if (item.isSymbolicLink()) hash.update(readlinkSync(child));
+      else hash.update(readFileSync(child));
+    }
+  };
+  visit(path, "");
+  return hash.digest("hex");
+}
+
+function skillMetadataIssue(path: string, directoryName: string): string | undefined {
+  const skillFile = join(path, "SKILL.md");
+  if (!existsSync(skillFile)) return "missing-SKILL.md";
+  const text = readFileSync(skillFile, "utf8");
+  const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
+  if (!frontmatter) return "invalid-frontmatter";
+  const declaredName = frontmatter.match(/^name:\s*["']?([^\s"']+)["']?\s*$/m)?.[1];
+  if (!declaredName) return "missing-frontmatter-name";
+  if (declaredName !== directoryName) return `name-mismatch:${declaredName}`;
+}
+
 export function validSkillName(name: string): boolean {
   return /^[a-z0-9][a-z0-9-]{0,63}$/.test(name);
 }
@@ -163,35 +200,73 @@ function detectedHarnesses(): Array<Harness & { installed: boolean; skillStatus:
   });
 }
 
+export function inspectSkillDirectory(skillDir: string, canonicalDir = canonicalSkills): SkillIssue[] {
+  const issues: SkillIssue[] = [];
+  if (!pathExists(skillDir)) return [{ path: skillDir, issue: "missing-directory" }];
+  const rootInfo = lstatSync(skillDir);
+  if (rootInfo.isSymbolicLink()) {
+    try {
+      if (realpathSync(skillDir) !== realpathSync(canonicalDir)) issues.push({ path: skillDir, issue: "wrong-directory-link" });
+    } catch { issues.push({ path: skillDir, issue: "broken-directory-link" }); }
+    return issues;
+  }
+  for (const name of readdirSync(skillDir).sort()) {
+    if (name.startsWith(".")) continue;
+    const path = join(skillDir, name);
+    const expected = join(canonicalDir, name);
+    const info = lstatSync(path);
+    if (info.isSymbolicLink()) {
+      try {
+        const actualTarget = realpathSync(path);
+        if (!pathExists(expected) || actualTarget !== realpathSync(expected)) issues.push({ path, issue: "wrong-skill-link" });
+      } catch { issues.push({ path, issue: "broken-skill-link" }); }
+    } else if (info.isDirectory()) {
+      const metadataIssue = skillMetadataIssue(path, name);
+      if (metadataIssue) issues.push({ path, issue: metadataIssue });
+      else if (!pathExists(expected)) issues.push({ path, issue: "untracked-copy" });
+      else {
+        const expectedPath = realpathSync(expected);
+        const expectedInfo = statSync(expectedPath);
+        if (!expectedInfo.isDirectory() || hashTree(path) !== hashTree(expectedPath)) issues.push({ path, issue: "copy-drift" });
+        else issues.push({ path, issue: "copy" });
+      }
+    }
+  }
+  return issues;
+}
+
 function normalizeMcpMap(raw: Record<string, any>): Record<string, McpServer> {
   return Object.fromEntries(Object.entries(raw).flatMap(([name, server]) => {
     if (!server || typeof server !== "object") return [];
     const commandArray = Array.isArray(server.command) ? server.command : undefined;
     const command = server.command ?? server.cmd;
-    if (!command && !server.url) return [];
+    const url = server.url ?? server.uri;
+    if (!command && !url) return [];
     const type = server.type === "remote" ? "http" : server.type === "local" ? "stdio" : server.type;
     return [[name, {
       ...(type ? { type } : {}),
       ...(command ? { command: commandArray ? commandArray[0] : command } : {}),
       ...(commandArray || server.args ? { args: commandArray ? commandArray.slice(1) : server.args } : {}),
+      ...(server.cwd ? { cwd: server.cwd } : {}),
       ...(server.env || server.environment || server.envs ? { env: server.env ?? server.environment ?? server.envs } : {}),
-      ...(server.url ? { url: server.url } : {}),
-      ...(server.headers ? { headers: server.headers } : {}),
-      ...(server.enabled !== undefined || server.type === "local" || server.type === "remote" ? { enabled: server.enabled !== false } : {}),
+      ...(url ? { url } : {}),
+      ...(server.headers || server.http_headers ? { headers: server.headers ?? server.http_headers } : {}),
+      ...(server.enabled !== undefined || server.disabled !== undefined || server.type === "local" || server.type === "remote" ? { enabled: server.disabled !== true && server.enabled !== false } : {}),
     }]];
   }));
 }
 
 export function normalizeMcpJson(path: string): Record<string, McpServer> {
-  const json = readJson(path);
+  const json = path.endsWith(".jsonc") ? Bun.JSONC.parse(readFileSync(path, "utf8")) as any : readJson(path);
   if (json.mcpServers && typeof json.mcpServers === "object") return normalizeMcpMap(json.mcpServers);
+  if (json.mcp?.servers && typeof json.mcp.servers === "object") return normalizeMcpMap(json.mcp.servers);
   if (json.mcp && typeof json.mcp === "object") return normalizeMcpMap(json.mcp);
   return {};
 }
 
 export function normalizeMcpFile(path: string): Record<string, McpServer> {
   const text = readFileSync(path, "utf8");
-  if (path.endsWith(".json")) return normalizeMcpJson(path);
+  if (path.endsWith(".json") || path.endsWith(".jsonc")) return normalizeMcpJson(path);
   const parsed = path.endsWith(".toml") ? Bun.TOML.parse(text) : Bun.YAML.parse(text) as any;
   const raw = parsed.mcp_servers ?? parsed.mcpServers ?? parsed.mcp ?? parsed.extensions ?? {};
   return normalizeMcpMap(raw);
@@ -264,14 +339,23 @@ function syncInstructions(args: string[]): void {
 }
 
 function audit(asJson: boolean): void {
-  const skills = detectedHarnesses().map(({ id, installed, skillDir, skillStatus }) => ({ id, installed, skillDir, skillStatus }));
+  const canonicalIssues = pathExists(canonicalSkills)
+    ? readdirSync(canonicalSkills).sort().flatMap((name) => {
+      const path = join(canonicalSkills, name);
+      if (name.startsWith(".") || !lstatSync(path).isDirectory() && !lstatSync(path).isSymbolicLink()) return [];
+      const issue = skillMetadataIssue(path, name);
+      return issue ? [{ path, issue }] : [];
+    })
+    : [{ path: canonicalSkills, issue: "missing-directory" }];
+  const skills = detectedHarnesses().map(({ id, installed, skillDir, skillStatus }) => ({ id, installed, skillDir, skillStatus, issues: inspectSkillDirectory(skillDir) }));
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
   const instructions = instructionTargets("all");
-  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), skills, mcp, instructions };
+  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, mcp, instructions };
   if (asJson) console.log(JSON.stringify(result, null, 2));
   else {
     console.log(`Canonical skills: ${canonicalSkills} (${result.canonicalExists ? "ok" : "missing"})`);
-    for (const item of skills) console.log(`${item.id}: ${item.installed ? "installed" : "config-only"}; skills=${item.skillStatus}`);
+    if (canonicalIssues.length) console.log(`canonical issues: ${canonicalIssues.length}`);
+    for (const item of skills) console.log(`${item.id}: ${item.installed ? "installed" : "config-only"}; skills=${item.skillStatus}; issues=${item.issues.length}`);
     for (const item of mcp) console.log(`${item.harness}: ${item.servers.length} MCP server(s) in ${item.path}`);
     for (const item of instructions) console.log(`instructions ${item.root}: ${item.status}`);
   }
@@ -404,8 +488,6 @@ function mcpSources(): McpSource[] {
     { harness: "opencode", path: join(root, "opencode.json"), scope: "project" },
     { harness: "opencode", path: join(root, ".opencode", "opencode.json"), scope: "project" },
     { harness: "gemini", path: join(root, ".gemini", "settings.json"), scope: "project" },
-    { harness: "hermes", path: join(root, ".hermes", "config.yaml"), scope: "project" },
-    { harness: "goose", path: join(root, ".goose", "config.yaml"), scope: "project" },
     { harness: "claude", path: join(home, ".claude.json"), scope: "global" },
     { harness: "codex", path: join(home, ".codex", "config.toml"), scope: "global" },
     { harness: "grok", path: join(home, ".grok", "config.toml"), scope: "global" },
@@ -416,11 +498,75 @@ function mcpSources(): McpSource[] {
   ];
 }
 
+function mcpTargetPath(harness: string, scope: "project" | "global"): string | undefined {
+  const root = projectRoot();
+  const paths: Record<string, { project?: string; global: string }> = {
+    codex: { project: join(root, ".codex", "config.toml"), global: join(home, ".codex", "config.toml") },
+    claude: { project: join(root, ".mcp.json"), global: join(home, ".claude.json") },
+    grok: { project: join(root, ".grok", "config.toml"), global: join(home, ".grok", "config.toml") },
+    opencode: { project: join(root, "opencode.json"), global: join(home, ".config", "opencode", "opencode.json") },
+    gemini: { project: join(root, ".gemini", "settings.json"), global: join(home, ".gemini", "settings.json") },
+    hermes: { global: join(home, ".hermes", "config.yaml") },
+    goose: { global: join(home, ".config", "goose", "config.yaml") },
+  };
+  return paths[harness]?.[scope];
+}
+
+function renderCodex(path: string, servers: Record<string, McpServer>): void {
+  let text = existsSync(path) ? readFileSync(path, "utf8").trimEnd() : "";
+  const line = (key: string, value: unknown) => `${key} = ${JSON.stringify(value)}`;
+  for (const [name, server] of Object.entries(servers)) {
+    const section = JSON.stringify(name);
+    const values = [
+      server.url ? line("url", server.url) : line("command", server.command),
+      ...(server.args?.length ? [line("args", server.args)] : []),
+      ...(server.cwd ? [line("cwd", server.cwd)] : []),
+      line("enabled", server.enabled !== false),
+    ];
+    text += `${text ? "\n\n" : ""}[mcp_servers.${section}]\n${values.join("\n")}`;
+    for (const [field, entries] of [["env", server.env], ["http_headers", server.headers]] as const) {
+      if (!entries || !Object.keys(entries).length) continue;
+      text += `\n\n[mcp_servers.${section}.${field}]\n${Object.entries(entries).map(([key, value]) => line(JSON.stringify(key), value)).join("\n")}`;
+    }
+  }
+  writeTextAtomic(path, `${text}\n`);
+}
+
+function renderOpenCode(path: string, servers: Record<string, McpServer>): void {
+  const json: any = existsSync(path) ? (path.endsWith(".jsonc") ? Bun.JSONC.parse(readFileSync(path, "utf8")) : readJson(path)) : { $schema: "https://opencode.ai/config.json" };
+  const v2 = Boolean(json.mcp?.servers);
+  const target = v2 ? (json.mcp.servers ??= {}) : (json.mcp ??= {});
+  for (const [name, server] of Object.entries(servers)) {
+    target[name] = server.url
+      ? { type: "remote", url: server.url, ...(server.headers ? { headers: server.headers } : {}), ...(v2 ? { disabled: server.enabled === false } : { enabled: server.enabled !== false }) }
+      : { type: "local", command: [server.command, ...(server.args ?? [])], ...(server.cwd ? { cwd: server.cwd } : {}), ...(server.env ? { environment: server.env } : {}), ...(v2 ? { disabled: server.enabled === false } : { enabled: server.enabled !== false }) };
+  }
+  writeJsonAtomic(path, json);
+}
+
+function renderYamlTarget(path: string, harness: "hermes" | "goose", servers: Record<string, McpServer>): void {
+  const yaml: any = existsSync(path) ? Bun.YAML.parse(readFileSync(path, "utf8")) : {};
+  const target = harness === "hermes" ? (yaml.mcp_servers ??= {}) : (yaml.extensions ??= {});
+  for (const [name, server] of Object.entries(servers)) {
+    target[name] = harness === "hermes"
+      ? { ...(server.url ? { url: server.url } : { command: server.command, args: server.args ?? [] }), ...(server.env ? { env: server.env } : {}), ...(server.headers ? { headers: server.headers } : {}), enabled: server.enabled !== false }
+      : { name, type: server.url ? "streamable_http" : "stdio", enabled: server.enabled !== false, ...(server.url ? { uri: server.url, ...(server.headers ? { headers: server.headers } : {}) } : { cmd: server.command, args: server.args ?? [], ...(server.env ? { envs: server.env } : {}) }) };
+  }
+  writeTextAtomic(path, Bun.YAML.stringify(yaml));
+}
+
+export function renderDirectTarget(harness: string, path: string, servers: Record<string, McpServer>): void {
+  if (harness === "codex") return renderCodex(path, servers);
+  if (harness === "opencode") return renderOpenCode(path, servers);
+  if (harness === "hermes" || harness === "goose") return renderYamlTarget(path, harness, servers);
+  fail(`no direct MCP renderer for ${harness}`);
+}
+
 function sourceForMcp(from: string, scope: string): McpSource {
   const directPath = isAbsolute(from) || from.startsWith(".") ? resolve(cwd, from) : "";
   if (directPath) {
     if (!existsSync(directPath)) fail(`MCP source not found: ${directPath}`);
-    return { harness: "file", path: directPath, scope: scope === "project" ? "project" : "global" };
+    return { harness: "file", path: directPath, scope: scope === "auto" ? inferMcpScope(directPath, projectRoot()) : scope as "project" | "global" };
   }
   const choices = mcpSources().filter((source) =>
     existsSync(source.path)
@@ -430,6 +576,35 @@ function sourceForMcp(from: string, scope: string): McpSource {
   );
   if (!choices.length) fail(`no supported ${scope} MCP source found for ${from}`);
   return choices[0];
+}
+
+export function inferMcpScope(path: string, root: string): "project" | "global" {
+  const position = relative(root, path);
+  return path === root || (!position.startsWith("..") && !isAbsolute(position)) ? "project" : "global";
+}
+
+function semanticMcp(server: McpServer): unknown {
+  const sorted = (value: Record<string, string> | undefined) => Object.fromEntries(Object.entries(value ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+  const headers = Object.fromEntries(Object.entries(server.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]).sort(([a], [b]) => a.localeCompare(b)));
+  return {
+    type: server.url ? (server.type === "sse" ? "sse" : "http") : "stdio",
+    command: server.command ?? "",
+    args: server.args ?? [],
+    cwd: server.cwd ?? "",
+    env: sorted(server.env),
+    url: server.url ?? "",
+    headers,
+    enabled: server.enabled !== false,
+  };
+}
+
+export function sameMcpServer(left: McpServer, right: McpServer): boolean {
+  return JSON.stringify(semanticMcp(left)) === JSON.stringify(semanticMcp(right));
+}
+
+function targetMcpServers(harness: string, scope: "project" | "global"): Record<string, McpServer> {
+  const path = mcpTargetPath(harness, scope);
+  return path && existsSync(path) ? normalizeMcpFile(path) : {};
 }
 
 function mcpSync(args: string[]): void {
@@ -444,26 +619,41 @@ function mcpSync(args: string[]): void {
   const servers = requestedServer ? Object.fromEntries(Object.entries(allServers).filter(([name]) => name === requestedServer)) : allServers;
   if (requestedServer && !Object.keys(servers).length) fail(`MCP server not found in source: ${requestedServer}`);
   const requestedTarget = valueAfter("--target", "");
-  const installed = detectedHarnesses().filter((item) => item.installed && ["claude", "grok", "gemini"].includes(item.id) && (!requestedTarget || item.id === requestedTarget));
+  const supportedTargets = ["codex", "claude", "grok", "opencode", "gemini", "hermes", "goose"];
+  const installed = detectedHarnesses().filter((item) => item.installed && supportedTargets.includes(item.id) && (!requestedTarget || item.id === requestedTarget));
   if (requestedTarget && !installed.length) fail(`MCP target not installed or unsupported: ${requestedTarget}`);
-  const conflicts: string[] = [], missing: Array<{ harness: string; name: string }> = [];
+  const conflicts: string[] = [], identical: string[] = [], missing: Array<{ harness: string; name: string }> = [];
+  const unsupported = installed.filter((target) => !mcpTargetPath(target.id, effectiveScope)).map((target) => `${target.id}:${effectiveScope}`);
   for (const target of installed) {
-    const names = new Set(target.mcpFiles.flatMap(mcpInventory));
-    for (const name of Object.keys(servers)) names.has(name) ? conflicts.push(`${target.id}:${name}`) : missing.push({ harness: target.id, name });
+    if (!mcpTargetPath(target.id, effectiveScope)) continue;
+    const existing = targetMcpServers(target.id, effectiveScope);
+    for (const [name, server] of Object.entries(servers)) {
+      if (!existing[name]) missing.push({ harness: target.id, name });
+      else if (sameMcpServer(server, existing[name])) identical.push(`${target.id}:${name}`);
+      else conflicts.push(`${target.id}:${name}`);
+    }
   }
   console.log(`Source: ${source.harness}:${source.path} (${Object.keys(servers).length} servers); scope=${effectiveScope}`);
   console.log(`Missing: ${missing.map((item) => `${item.harness}:${item.name}`).join(", ") || "none"}`);
-  console.log(`Existing names requiring semantic review: ${conflicts.join(", ") || "none"}`);
+  console.log(`Identical: ${identical.join(", ") || "none"}`);
+  console.log(`Conflicts: ${conflicts.join(", ") || "none"}`);
+  console.log(`Unsupported scope: ${unsupported.join(", ") || "none"}`);
   if (!apply) return;
   if (conflicts.length) fail("existing server names require separate conflict confirmation; resolve or narrow source first");
+  const targetPaths = installed.map((item) => mcpTargetPath(item.id, effectiveScope)).filter((path): path is string => Boolean(path));
   if (effectiveScope === "project" && hasSecretLiterals(servers)) {
-    const projectTargets = [join(cwd, ".mcp.json"), join(cwd, ".grok", "config.toml"), join(cwd, ".gemini", "settings.json")];
-    const unsafe = projectTargets.filter((path) => !gitIgnored(path));
+    const unsafe = targetPaths.filter((path) => !gitIgnored(path));
     if (unsafe.length) fail(`secret-bearing project configs must be gitignored: ${unsafe.join(", ")}`);
   }
-  const backupRoot = backup(installed.flatMap((item) => item.mcpFiles));
+  const backupRoot = backup(targetPaths);
   try {
+    for (const harness of ["codex", "opencode", "hermes", "goose"]) {
+      const path = mcpTargetPath(harness, effectiveScope);
+      const selected = Object.fromEntries(missing.filter((item) => item.harness === harness).map((item) => [item.name, servers[item.name]]));
+      if (path && Object.keys(selected).length) renderDirectTarget(harness, path, selected);
+    }
     for (const item of missing) {
+      if (["codex", "opencode", "hermes", "goose"].includes(item.harness)) continue;
       const server = servers[item.name];
       const transport = server.url ? (server.type === "sse" ? "sse" : "http") : "stdio";
       const envArgs = Object.entries(server.env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]);

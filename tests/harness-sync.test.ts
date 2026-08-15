@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inspectInstructions, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, removalTargets, validSkillName } from "../scripts/harness-sync";
+import { inferMcpScope, inspectInstructions, inspectSkillDirectory, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, removalTargets, renderDirectTarget, sameMcpServer, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -47,6 +47,21 @@ describe("skill removal", () => {
   });
 });
 
+describe("skill audit", () => {
+  test("finds wrong links and drifted copies", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const canonical = join(root, "canonical");
+    const target = join(root, "target");
+    mkdirSync(join(canonical, "demo"), { recursive: true });
+    mkdirSync(join(target, "demo"), { recursive: true });
+    writeFileSync(join(canonical, "demo", "SKILL.md"), "---\nname: demo\n---\ncanonical");
+    writeFileSync(join(target, "demo", "SKILL.md"), "---\nname: demo\n---\nchanged");
+    symlinkSync("missing", join(target, "broken"));
+    expect(inspectSkillDirectory(target, canonical).map((item) => item.issue)).toEqual(["broken-skill-link", "copy-drift"]);
+  });
+});
+
 describe("MCP normalization", () => {
   test("reads Claude shape", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
@@ -85,6 +100,29 @@ describe("MCP normalization", () => {
     writeFileSync(path, "extensions:\n  demo:\n    type: stdio\n    cmd: npx\n    args: [demo]\n    enabled: true\n");
     expect(normalizeMcpFile(path).demo?.command).toBe("npx");
     expect(normalizeMcpFile(path).demo?.args).toEqual(["demo"]);
+  });
+
+  test("compares normalized definitions instead of names", () => {
+    expect(sameMcpServer({ command: "npx", args: ["demo"], env: { B: "2", A: "1" } }, { type: "stdio", command: "npx", args: ["demo"], env: { A: "1", B: "2" }, enabled: true })).toBeTrue();
+    expect(sameMcpServer({ url: "https://example.test", headers: { Authorization: "x" } }, { type: "http", url: "https://example.test", headers: { authorization: "x" } })).toBeTrue();
+    expect(sameMcpServer({ command: "npx", args: ["one"] }, { command: "npx", args: ["two"] })).toBeFalse();
+  });
+
+  test("infers explicit file scope from project containment", () => {
+    expect(inferMcpScope("/work/repo/.mcp.json", "/work/repo")).toBe("project");
+    expect(inferMcpScope("/home/user/.mcp.json", "/work/repo")).toBe("global");
+  });
+
+  test("renders Codex, OpenCode, Hermes, and Goose targets", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const server = { demo: { command: "npx", args: ["demo"], env: { TOKEN: "value" } } };
+    for (const [harness, filename] of [["codex", "config.toml"], ["opencode", "opencode.json"], ["hermes", "hermes.yaml"], ["goose", "goose.yaml"]]) {
+      const path = join(root, filename);
+      renderDirectTarget(harness, path, server);
+      expect(normalizeMcpFile(path).demo?.command).toBe("npx");
+      expect(normalizeMcpFile(path).demo?.args).toEqual(["demo"]);
+    }
   });
 });
 
