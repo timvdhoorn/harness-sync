@@ -27,7 +27,8 @@ Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands
 
 ## Commands
 
-- `audit` — inspect detected harnesses, skill paths, symlinks, MCP files, locks, and drift.
+- `audit` — inspect detected harnesses, skill paths, instruction links, MCP files, locks, and drift.
+- `instructions [--scope project|user|all]` — make `AGENTS.md` canonical and link `CLAUDE.md` to it.
 - `add <source|npx skills add ...>` — accept repository/tree/direct URLs, `skills.sh` URLs, local paths, and `npx skills add` commands.
 - `remove <skill>` — remove an owned skill from canonical storage and every detected harness.
 - `update [skill ...]` — plan or update tracked global skills.
@@ -36,3 +37,4 @@ Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands
 
 Read [references/behavior.md](references/behavior.md) only when resolving source, MCP, platform, ownership, or recovery details.
 
+For `instructions`, include the project and user home by default. A real `CLAUDE.md` is a conflict: explain that it will be backed up and require separate confirmation before using `--replace`.

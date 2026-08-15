@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { normalizeAddInput, normalizeMcpJson, validSkillName } from "../scripts/harness-sync";
+import { inspectInstructions, normalizeAddInput, normalizeMcpJson, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -61,3 +61,21 @@ describe("MCP normalization", () => {
   });
 });
 
+describe("instruction files", () => {
+  test("AGENTS.md is canonical for CLAUDE.md", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    writeFileSync(join(root, "AGENTS.md"), "# Rules\n");
+    expect(inspectInstructions(root).status).toBe("missing-claude");
+    symlinkSync("AGENTS.md", join(root, "CLAUDE.md"));
+    expect(inspectInstructions(root).status).toBe("correct-link");
+  });
+
+  test("reports a real CLAUDE.md as conflict", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    writeFileSync(join(root, "AGENTS.md"), "# Rules\n");
+    writeFileSync(join(root, "CLAUDE.md"), "# Claude\n");
+    expect(inspectInstructions(root).status).toBe("conflict");
+  });
+});

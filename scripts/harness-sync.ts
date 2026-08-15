@@ -14,6 +14,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -209,15 +210,78 @@ function mcpInventory(path: string): string[] {
   return [];
 }
 
+type InstructionsStatus = {
+  root: string;
+  agents: string;
+  claude: string;
+  status: "missing-agents" | "missing-claude" | "correct-link" | "wrong-link" | "conflict";
+};
+
+function pathExists(path: string): boolean {
+  try { lstatSync(path); return true; } catch { return false; }
+}
+
+function projectRoot(): string {
+  if (!commandExists("git")) return cwd;
+  const result = Bun.spawnSync(["git", "rev-parse", "--show-toplevel"], { cwd, stdout: "pipe", stderr: "ignore" });
+  return result.exitCode === 0 ? result.stdout.toString().trim() : cwd;
+}
+
+export function inspectInstructions(root: string): InstructionsStatus {
+  const agents = join(root, "AGENTS.md");
+  const claude = join(root, "CLAUDE.md");
+  if (!pathExists(agents)) return { root, agents, claude, status: "missing-agents" };
+  if (!pathExists(claude)) return { root, agents, claude, status: "missing-claude" };
+  if (!lstatSync(claude).isSymbolicLink()) return { root, agents, claude, status: "conflict" };
+  try {
+    return { root, agents, claude, status: realpathSync(claude) === realpathSync(agents) ? "correct-link" : "wrong-link" };
+  } catch {
+    return { root, agents, claude, status: "wrong-link" };
+  }
+}
+
+function instructionTargets(scope: string): InstructionsStatus[] {
+  const roots = scope === "project" ? [projectRoot()] : scope === "user" ? [home] : [projectRoot(), home];
+  return [...new Set(roots)].map(inspectInstructions);
+}
+
+function syncInstructions(args: string[]): void {
+  const apply = applyRequired(args);
+  const scopeIndex = args.indexOf("--scope");
+  const scope = scopeIndex >= 0 ? args[scopeIndex + 1] : "all";
+  if (!["project", "user", "all"].includes(scope)) fail("--scope must be project, user, or all");
+  const targets = instructionTargets(scope);
+  for (const item of targets) console.log(`${item.root}: ${item.status}`);
+  const changes = targets.filter((item) => ["missing-claude", "wrong-link", "conflict"].includes(item.status));
+  const conflicts = changes.filter((item) => item.status === "conflict");
+  console.log(`Plan: link ${changes.length} CLAUDE.md path(s) to AGENTS.md`);
+  if (!apply) return;
+  if (conflicts.length && !args.includes("--replace")) fail(`existing CLAUDE.md requires explicit --replace: ${conflicts.map((item) => item.claude).join(", ")}`);
+  const backupRoot = backup(changes.map((item) => item.claude));
+  try {
+    for (const item of changes) {
+      if (pathExists(item.claude)) rmSync(item.claude, { recursive: true, force: true });
+      symlinkSync("AGENTS.md", item.claude);
+    }
+    cleanOldBackups();
+    console.log(`Applied ${changes.length} instruction link(s). Backup: ${backupRoot}`);
+  } catch (error) {
+    restoreBackup(backupRoot);
+    throw new Error(`instruction sync failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
+  }
+}
+
 function audit(asJson: boolean): void {
   const skills = detectedHarnesses().map(({ id, installed, skillDir, skillStatus }) => ({ id, installed, skillDir, skillStatus }));
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
-  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), ledger: existsSync(ledgerPath), skills, mcp };
+  const instructions = instructionTargets("all");
+  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), ledger: existsSync(ledgerPath), skills, mcp, instructions };
   if (asJson) console.log(JSON.stringify(result, null, 2));
   else {
     console.log(`Canonical skills: ${canonicalSkills} (${result.canonicalExists ? "ok" : "missing"})`);
     for (const item of skills) console.log(`${item.id}: ${item.installed ? "installed" : "config-only"}; skills=${item.skillStatus}`);
     for (const item of mcp) console.log(`${item.harness}: ${item.servers.length} MCP server(s) in ${item.path}`);
+    for (const item of instructions) console.log(`instructions ${item.root}: ${item.status}`);
   }
 }
 
@@ -418,7 +482,7 @@ function mcpSync(args: string[]): void {
 }
 
 function usage(): void {
-  console.log(`harness-sync [audit|add|remove|update|mcp|adopt]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
+  console.log(`harness-sync [audit|instructions|add|remove|update|mcp|adopt]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
 }
 
 export function main(argv = process.argv.slice(2)): void {
@@ -426,6 +490,7 @@ export function main(argv = process.argv.slice(2)): void {
   try {
     if (!command) return usage();
     if (command === "audit") return audit(args.includes("--json"));
+    if (command === "instructions") return syncInstructions(args);
     if (command === "add") return addSkill(args);
     if (command === "remove") return removeSkill(args[0] ?? "", args.slice(1));
     if (command === "update") return updateSkills(args, args);

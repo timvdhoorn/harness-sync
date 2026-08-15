@@ -14,6 +14,10 @@ Detect Codex, Claude Code, Pi, Grok, OpenCode, Gemini, Hermes, and Goose. Mutate
 
 Prefer native MCP CLIs. Write native config directly only for formats implemented by the CLI. Unknown versions and schemas remain audit-only.
 
+## Instruction files
+
+In projects, `AGENTS.md` is canonical and `CLAUDE.md` is a relative symlink to it. Apply the same rule in the user home when `~/AGENTS.md` exists. Preserve a real `CLAUDE.md` until the user explicitly confirms replacement; back it up before creating the link.
+
 ## Sources
 
 Accept local paths, GitHub/GitLab repositories and tree URLs, arbitrary git URLs supported by `npx skills`, direct skill/archive URLs, `skills.sh/<owner>/<repo>/<skill>`, and allowlisted `npx skills add ...` commands. Local sources copy by default; link only when explicitly requested.
