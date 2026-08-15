@@ -38,16 +38,10 @@ type Harness = {
   npxAgent?: string;
 };
 
-type Ledger = {
-  version: 1;
-  skills: Record<string, { source: string; adopted?: boolean; installedAt: string }>;
-};
-
 const home = homedir();
 const stateRoot = process.env.XDG_STATE_HOME
   ? join(process.env.XDG_STATE_HOME, "harness-sync")
   : join(home, ".local", "state", "harness-sync");
-const ledgerPath = join(stateRoot, "ledger.json");
 const canonicalSkills = join(home, ".agents", "skills");
 const cwd = process.cwd();
 
@@ -91,22 +85,6 @@ function writeJsonAtomic(path: string, value: unknown): void {
   writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   renameSync(temp, path);
   chmodSync(path, 0o600);
-}
-
-function loadLedger(): Ledger {
-  if (!existsSync(ledgerPath)) return { version: 1, skills: {} };
-  try {
-    const parsed = readJson(ledgerPath);
-    return parsed.version === 1 && parsed.skills ? parsed : { version: 1, skills: {} };
-  } catch {
-    fail(`invalid ledger: ${ledgerPath}`);
-  }
-}
-
-function saveLedger(ledger: Ledger): void {
-  mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
-  chmodSync(stateRoot, 0o700);
-  writeJsonAtomic(ledgerPath, ledger);
 }
 
 function timestamp(): string {
@@ -275,7 +253,7 @@ function audit(asJson: boolean): void {
   const skills = detectedHarnesses().map(({ id, installed, skillDir, skillStatus }) => ({ id, installed, skillDir, skillStatus }));
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
   const instructions = instructionTargets("all");
-  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), ledger: existsSync(ledgerPath), skills, mcp, instructions };
+  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), skills, mcp, instructions };
   if (asJson) console.log(JSON.stringify(result, null, 2));
   else {
     console.log(`Canonical skills: ${canonicalSkills} (${result.canonicalExists ? "ok" : "missing"})`);
@@ -332,12 +310,9 @@ function addSkill(args: string[]): void {
   const command = ["npx", "--yes", "skills", "add", ...sourceArgs, "-g", "-y", "--agent", ...agents];
   console.log(`Plan: ${command.join(" ")}`);
   if (!apply) return;
-  const backupRoot = backup([ledgerPath, canonicalSkills, ...harnesses.map((item) => item.skillDir)]);
+  const backupRoot = backup([canonicalSkills, ...harnesses.map((item) => item.skillDir)]);
   try {
     run(command);
-    const ledger = loadLedger();
-    ledger.skills[`source:${sourceArgs[0]}`] = { source: sourceArgs.join(" "), installedAt: new Date().toISOString() };
-    saveLedger(ledger);
     cleanOldBackups();
     console.log(`Applied. Backup: ${backupRoot}`);
   } catch (error) {
@@ -364,17 +339,14 @@ export function removalTargets(name: string, skillDirs = [canonicalSkills, ...ha
 function removeSkill(name: string, args: string[]): void {
   const apply = applyRequired(args);
   if (!validSkillName(name)) fail("invalid skill name");
-  const ledger = loadLedger();
   const targets = removalTargets(name);
   if (!targets.length) fail(`skill not found: ${name}`);
   console.log(`Plan: remove ${name} from ${targets.length} path(s):\n${targets.join("\n")}`);
   if (!apply) return;
-  const backupRoot = backup([ledgerPath, ...targets, join(home, ".agents", ".skill-lock.json"), join(cwd, "skills-lock.json")]);
+  const backupRoot = backup([...targets, join(home, ".agents", ".skill-lock.json"), join(cwd, "skills-lock.json")]);
   try {
     if (npxLockOwns(name)) run(["npx", "--yes", "skills", "remove", name, "-g", "-y"]);
     for (const target of targets) if (existsSync(target)) rmSync(target, { recursive: true, force: true });
-    delete ledger.skills[name];
-    saveLedger(ledger);
     cleanOldBackups();
     console.log(`Removed ${name}. Backup: ${backupRoot}`);
   } catch (error) {
@@ -390,7 +362,7 @@ function updateSkills(names: string[], args: string[]): void {
   const command = ["npx", "--yes", "skills", "update", ...cleanNames, "-g", "-y"];
   console.log(`Plan: ${command.join(" ")}; upstream deletions remain pending`);
   if (!apply) return;
-  const backupRoot = backup([ledgerPath, join(home, ".agents", ".skill-lock.json"), canonicalSkills]);
+  const backupRoot = backup([join(home, ".agents", ".skill-lock.json"), canonicalSkills]);
   try { run(command); cleanOldBackups(); console.log(`Applied. Backup: ${backupRoot}`); }
   catch (error) { restoreBackup(backupRoot); throw new Error(`update failed; rolled back from ${backupRoot}: ${(error as Error).message}`); }
 }
