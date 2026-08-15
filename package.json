@@ -1,0 +1,11 @@
+{
+  "name": "harness-sync",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "harness-sync": "bun run scripts/harness-sync.ts",
+    "test": "bun test",
+    "check": "bun test && bun run scripts/harness-sync.ts audit --json"
+  }
+}
+
