@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { discoverMarketplaceSkills, inferMcpScope, inspectInstructions, inspectSkillDirectory, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, removalTargets, renderDirectTarget, sameMcpServer, validSkillName } from "../scripts/harness-sync";
+import { discoverMarketplaceSkills, inferMcpScope, inferMcpUpstream, inspectInstructions, inspectSkillDirectory, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, removalTargets, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -29,6 +29,44 @@ describe("skill sources", () => {
   });
 });
 
+describe("skill provenance", () => {
+  test("initializes known sources from the npx lock and keeps unknown skills explicit", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const canonical = join(root, "skills");
+    mkdirSync(join(canonical, "known"), { recursive: true });
+    mkdirSync(join(canonical, "manual"), { recursive: true });
+    writeFileSync(join(canonical, "known", "SKILL.md"), "---\nname: known\n---\nknown");
+    writeFileSync(join(canonical, "manual", "SKILL.md"), "---\nname: manual\n---\nmanual");
+    const lock = join(root, "lock.json");
+    writeFileSync(lock, JSON.stringify({ skills: { known: { source: "owner/repo", sourceType: "github", sourceUrl: "https://github.com/owner/repo.git", skillPath: "skills/known/SKILL.md", skillFolderHash: "version-1", installedAt: "2026-01-01", updatedAt: "2026-01-02" } } }));
+    const manifest = scanSkillManifest(canonical, [lock], { version: 1, skills: {} }, "2026-02-01");
+    expect(manifest.skills.known.source).toBe("owner/repo");
+    expect(manifest.skills.known.version).toBe("version-1");
+    expect(manifest.skills.known.provenance).toBe("lock-import");
+    expect(manifest.skills.manual.source).toBeNull();
+    expect(manifest.skills.manual.provenance).toBe("scan");
+  });
+
+  test("preserves provenance and versions while content is unchanged", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const canonical = join(root, "skills");
+    mkdirSync(join(canonical, "demo"), { recursive: true });
+    writeFileSync(join(canonical, "demo", "SKILL.md"), "---\nname: demo\n---\ndemo");
+    const first = scanSkillManifest(canonical, [], { version: 1, skills: {} }, "first");
+    first.skills.demo.source = "owner/repo";
+    first.skills.demo.provenance = "install";
+    first.skills.demo.fullDepth = true;
+    const second = scanSkillManifest(canonical, [], first, "second");
+    expect(second.skills.demo.source).toBe("owner/repo");
+    expect(second.skills.demo.version).toBe(first.skills.demo.version);
+    expect(second.skills.demo.updatedAt).toBe("first");
+    expect(second.skills.demo.provenance).toBe("install");
+    expect(second.skills.demo.fullDepth).toBeTrue();
+  });
+});
+
 describe("skill names", () => {
   test("rejects traversal and uppercase", () => {
     expect(validSkillName("harness-sync")).toBeTrue();
@@ -44,6 +82,16 @@ describe("skill removal", () => {
     const skill = join(root, "manual-skill");
     writeFileSync(skill, "manual");
     expect(removalTargets("manual-skill", [root])).toEqual([skill]);
+  });
+
+  test("removes a broken skill symlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const skill = join(root, "broken-skill");
+    symlinkSync("missing-target", skill);
+    expect(removalTargets("broken-skill", [root])).toEqual([skill]);
+    removeExistingPath(skill);
+    expect(() => lstatSync(skill)).toThrow();
   });
 });
 
@@ -141,6 +189,34 @@ describe("MCP normalization", () => {
       expect(normalizeMcpFile(path).demo?.command).toBe("npx");
       expect(normalizeMcpFile(path).demo?.args).toEqual(["demo"]);
     }
+  });
+});
+
+describe("MCP provenance", () => {
+  test("infers known package and remote upstreams", () => {
+    expect(inferMcpUpstream({ command: "npx", args: ["-y", "@vendor/demo@latest"] })).toEqual({ source: "@vendor/demo@latest", sourceType: "npm", provenance: "inferred" });
+    expect(inferMcpUpstream({ command: "uvx", args: ["demo-mcp"] }).sourceType).toBe("pypi");
+    expect(inferMcpUpstream({ url: "https://mcp.example.test" }).sourceType).toBe("url");
+    expect(inferMcpUpstream({ command: "/opt/internal-mcp" }).source).toBeNull();
+  });
+
+  test("registers locations without storing secret values and flags semantic conflicts", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const claude = join(root, ".mcp.json");
+    const codex = join(root, "config.toml");
+    writeFileSync(claude, JSON.stringify({ mcpServers: { demo: { command: "npx", args: ["demo"], env: { TOKEN: "first-secret" } } } }));
+    writeFileSync(codex, '[mcp_servers.demo]\ncommand = "npx"\nargs = ["demo"]\n[mcp_servers.demo.env]\nTOKEN = "second-secret"\n');
+    const manifest = scanMcpManifest([
+      { harness: "claude", path: claude, scope: "project" },
+      { harness: "codex", path: codex, scope: "global" },
+    ], { version: 1, servers: {} }, "now");
+    expect(manifest.servers.demo.source).toBe("demo");
+    expect(manifest.servers.demo.sourceType).toBe("npm");
+    expect(manifest.servers.demo.conflict).toBeTrue();
+    expect(manifest.servers.demo.configHash).toBeNull();
+    expect(JSON.stringify(manifest)).not.toContain("first-secret");
+    expect(JSON.stringify(manifest)).not.toContain("second-secret");
   });
 });
 

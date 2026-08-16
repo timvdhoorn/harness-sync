@@ -5,6 +5,8 @@
 - Canonical skills: `~/.agents/skills`.
 - Backups: `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/<timestamp>`; directory mode `0700`, files `0600`.
 - `npx skills` locks remain evidence, not desired state.
+- Skill provenance lives in `${XDG_STATE_HOME:-~/.local/state}/harness-sync/skills.json`. It records source, exact installed content version, current content hash, and timestamps. `init` imports trustworthy metadata from existing `npx skills` locks and marks everything else as unknown rather than guessing.
+- MCP provenance lives in `${XDG_STATE_HOME:-~/.local/state}/harness-sync/mcps.json`. It records semantic hashes and config locations without secret values. Infer upstreams only for remote URLs and recognizable npm, PyPI, or container launchers; keep other sources unknown. Mark same-name semantic differences as conflicts.
 - Back up every affected path before mutation. Restore automatically when apply fails.
 
 ## Harnesses

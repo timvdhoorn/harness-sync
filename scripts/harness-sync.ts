@@ -42,12 +42,38 @@ type Harness = {
 type McpSource = { harness: string; path: string; scope: "project" | "global" };
 type SkillIssue = { path: string; issue: string };
 type MarketplaceSkill = { name: string; hash: string; status: "available" | "canonical" | "conflict"; sources: Array<{ harness: string; marketplace: string; plugin: string; path: string }> };
+export type TrackedSkill = {
+  source: string | null;
+  sourceType: string | null;
+  sourceUrl: string | null;
+  skillPath: string | null;
+  fullDepth?: boolean;
+  version: string;
+  contentHash: string;
+  installedAt: string | null;
+  updatedAt: string;
+  provenance: "install" | "lock-import" | "scan";
+};
+export type SkillManifest = { version: 1; skills: Record<string, TrackedSkill> };
+export type McpInstallation = { harness: string; path: string; scope: "project" | "global"; configHash: string };
+export type TrackedMcp = {
+  source: string | null;
+  sourceType: "url" | "npm" | "pypi" | "docker" | null;
+  configHash: string | null;
+  conflict: boolean;
+  installations: McpInstallation[];
+  updatedAt: string;
+  provenance: "inferred" | "scan";
+};
+export type McpManifest = { version: 1; servers: Record<string, TrackedMcp> };
 
 const home = homedir();
 const stateRoot = process.env.XDG_STATE_HOME
   ? join(process.env.XDG_STATE_HOME, "harness-sync")
   : join(home, ".local", "state", "harness-sync");
 const canonicalSkills = join(home, ".agents", "skills");
+const skillManifestPath = join(stateRoot, "skills.json");
+const mcpManifestPath = join(stateRoot, "mcps.json");
 const cwd = process.cwd();
 
 export const harnesses: Harness[] = [
@@ -157,6 +183,69 @@ function hashTree(path: string): string {
   };
   visit(path, "");
   return hash.digest("hex");
+}
+
+function readSkillManifest(path = skillManifestPath): SkillManifest {
+  if (!existsSync(path)) return { version: 1, skills: {} };
+  const value = readJson(path);
+  if (value?.version !== 1 || !value.skills || typeof value.skills !== "object") throw new Error(`invalid skill manifest: ${path}`);
+  return value as SkillManifest;
+}
+
+function readMcpManifest(path = mcpManifestPath): McpManifest {
+  if (!existsSync(path)) return { version: 1, servers: {} };
+  const value = readJson(path);
+  if (value?.version !== 1 || !value.servers || typeof value.servers !== "object") throw new Error(`invalid MCP manifest: ${path}`);
+  return value as McpManifest;
+}
+
+function readSkillLocks(paths: string[]): Record<string, any> {
+  const skills: Record<string, any> = {};
+  for (const path of paths) {
+    if (!existsSync(path)) continue;
+    try { Object.assign(skills, readJson(path).skills ?? {}); } catch { /* audit owns malformed lock reporting */ }
+  }
+  return skills;
+}
+
+export function scanSkillManifest(
+  canonicalDir: string,
+  lockPaths: string[],
+  previous: SkillManifest = { version: 1, skills: {} },
+  now = new Date().toISOString(),
+): SkillManifest {
+  const locks = readSkillLocks(lockPaths);
+  const skills: Record<string, TrackedSkill> = {};
+  if (!pathExists(canonicalDir)) return { version: 1, skills };
+  for (const name of readdirSync(canonicalDir).sort()) {
+    const path = join(canonicalDir, name);
+    if (name.startsWith(".") || !validSkillName(name)) continue;
+    try { if (!statSync(path).isDirectory()) continue; } catch { continue; }
+    const prior = previous.skills[name];
+    const lock = locks[name];
+    const contentHash = hashTree(path);
+    skills[name] = {
+      source: lock?.source ?? prior?.source ?? null,
+      sourceType: lock?.sourceType ?? prior?.sourceType ?? null,
+      sourceUrl: lock?.sourceUrl ?? prior?.sourceUrl ?? null,
+      skillPath: lock?.skillPath ?? prior?.skillPath ?? null,
+      ...(prior?.fullDepth ? { fullDepth: true } : {}),
+      version: lock?.skillFolderHash ?? (prior?.contentHash === contentHash ? prior.version : contentHash),
+      contentHash,
+      installedAt: lock?.installedAt ?? prior?.installedAt ?? null,
+      updatedAt: lock?.updatedAt ?? (prior?.contentHash === contentHash ? prior.updatedAt : now),
+      provenance: prior?.provenance === "install" ? "install" : lock ? "lock-import" : "scan",
+    };
+  }
+  return { version: 1, skills };
+}
+
+function globalSkillLocks(): string[] {
+  return [join(home, ".agents", ".skill-lock.json"), join(cwd, "skills-lock.json")];
+}
+
+function currentSkillManifest(): SkillManifest {
+  return scanSkillManifest(canonicalSkills, globalSkillLocks(), readSkillManifest());
 }
 
 function skillMetadataIssue(path: string, directoryName: string): string | undefined {
@@ -359,8 +448,17 @@ function audit(asJson: boolean): void {
   const skills = detectedHarnesses().map(({ id, installed, skillDir }) => ({ id, installed, skillDir, issues: inspectSkillDirectory(skillDir) }));
   const marketplaceSkills = discoverMarketplaceSkills();
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
+  const mcpManifest = scanMcpManifest(mcpSources(), readMcpManifest());
+  const mcpProvenance = {
+    path: mcpManifestPath,
+    exists: existsSync(mcpManifestPath),
+    servers: Object.keys(mcpManifest.servers).length,
+    known: Object.values(mcpManifest.servers).filter((item) => item.source).length,
+    unknown: Object.values(mcpManifest.servers).filter((item) => !item.source).length,
+    conflicts: Object.entries(mcpManifest.servers).filter(([, item]) => item.conflict).map(([name]) => name),
+  };
   const instructions = instructionTargets("all");
-  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, instructions };
+  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, instructions };
   if (asJson) console.log(JSON.stringify(result, null, 2));
   else {
     console.log(`Canonical skills: ${canonicalSkills} (${result.canonicalExists ? "ok" : "missing"})`);
@@ -369,6 +467,7 @@ function audit(asJson: boolean): void {
     const candidates = marketplaceSkills.filter((item) => item.status !== "canonical");
     console.log(`marketplace skills: ${marketplaceSkills.length}; choices=${candidates.length}`);
     for (const item of mcp) console.log(`${item.harness}: ${item.servers.length} MCP server(s) in ${item.path}`);
+    console.log(`MCP provenance: ${mcpProvenance.exists ? "initialized" : "missing"}; servers=${mcpProvenance.servers}; known=${mcpProvenance.known}; unknown=${mcpProvenance.unknown}; conflicts=${mcpProvenance.conflicts.length}`);
     for (const item of instructions) console.log(`instructions ${item.root}: ${item.status}`);
   }
 }
@@ -420,11 +519,22 @@ function addSkill(args: string[]): void {
   const command = ["npx", "--yes", "skills", "add", ...sourceArgs, "-g", "-y", "--agent", ...agents];
   console.log(`Plan: ${command.join(" ")}`);
   if (!apply) return;
-  const backupRoot = backup([canonicalSkills, ...harnesses.map((item) => item.skillDir)]);
+  const before = currentSkillManifest();
+  const backupRoot = backup([canonicalSkills, ...harnesses.map((item) => item.skillDir), skillManifestPath]);
   try {
     run(command);
+    const after = scanSkillManifest(canonicalSkills, globalSkillLocks(), before);
+    const selectedIndex = sourceArgs.indexOf("--skill");
+    const selected = selectedIndex >= 0 ? new Set(sourceArgs.slice(selectedIndex + 1).filter((item) => !item.startsWith("--"))) : null;
+    for (const [name, item] of Object.entries(after.skills)) {
+      if ((selected?.has(name) || before.skills[name]?.contentHash !== item.contentHash || !before.skills[name]) && item.source) {
+        item.provenance = "install";
+        if (sourceArgs.includes("--full-depth")) item.fullDepth = true;
+      }
+    }
+    writeJsonAtomic(skillManifestPath, after);
     cleanOldBackups();
-    console.log(`Applied. Backup: ${backupRoot}`);
+    console.log(`Applied. Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
   } catch (error) {
     restoreBackup(backupRoot);
     throw new Error(`add failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
@@ -432,7 +542,7 @@ function addSkill(args: string[]): void {
 }
 
 function npxLockOwns(name: string): boolean {
-  for (const path of [join(home, ".agents", ".skill-lock.json"), join(cwd, "skills-lock.json")]) {
+  for (const path of globalSkillLocks()) {
     if (!existsSync(path)) continue;
     try {
       const text = readFileSync(path, "utf8");
@@ -446,6 +556,10 @@ export function removalTargets(name: string, skillDirs = [canonicalSkills, ...ha
   return [...new Set(skillDirs.map((directory) => join(directory, name)))].filter(pathExists);
 }
 
+export function removeExistingPath(path: string): void {
+  if (pathExists(path)) rmSync(path, { recursive: true, force: true });
+}
+
 function removeSkill(name: string, args: string[]): void {
   const apply = applyRequired(args);
   if (!validSkillName(name)) fail("invalid skill name");
@@ -453,10 +567,13 @@ function removeSkill(name: string, args: string[]): void {
   if (!targets.length) fail(`skill not found: ${name}`);
   console.log(`Plan: remove ${name} from ${targets.length} path(s):\n${targets.join("\n")}`);
   if (!apply) return;
-  const backupRoot = backup([...targets, join(home, ".agents", ".skill-lock.json"), join(cwd, "skills-lock.json")]);
+  const backupRoot = backup([...targets, ...globalSkillLocks(), skillManifestPath]);
   try {
     if (npxLockOwns(name)) run(["npx", "--yes", "skills", "remove", name, "-g", "-y"]);
-    for (const target of targets) if (existsSync(target)) rmSync(target, { recursive: true, force: true });
+    for (const target of targets) removeExistingPath(target);
+    const manifest = readSkillManifest();
+    delete manifest.skills[name];
+    writeJsonAtomic(skillManifestPath, manifest);
     cleanOldBackups();
     console.log(`Removed ${name}. Backup: ${backupRoot}`);
   } catch (error) {
@@ -469,12 +586,53 @@ function updateSkills(names: string[], args: string[]): void {
   const apply = applyRequired(args);
   const cleanNames = names.filter((name) => !name.startsWith("--"));
   for (const name of cleanNames) if (!validSkillName(name)) fail(`invalid skill name: ${name}`);
-  const command = ["npx", "--yes", "skills", "update", ...cleanNames, "-g", "-y"];
-  console.log(`Plan: ${command.join(" ")}; upstream deletions remain pending`);
+  const manifest = currentSkillManifest();
+  const requested = cleanNames.length ? cleanNames : Object.keys(manifest.skills);
+  const missing = requested.filter((name) => !manifest.skills[name]);
+  if (missing.length) fail(`skills not found in manifest; run init first: ${missing.join(", ")}`);
+  const unknown = requested.filter((name) => !manifest.skills[name].source);
+  const tracked = requested.filter((name) => manifest.skills[name].source);
+  for (const name of tracked) console.log(`Plan: update ${name} from ${manifest.skills[name].source} (current ${manifest.skills[name].version})`);
+  if (unknown.length) console.log(`Skip (unknown source): ${unknown.join(", ")}`);
+  if (cleanNames.length && unknown.length) fail(`cannot update skills with unknown source: ${unknown.join(", ")}`);
   if (!apply) return;
-  const backupRoot = backup([join(home, ".agents", ".skill-lock.json"), canonicalSkills]);
-  try { run(command); cleanOldBackups(); console.log(`Applied. Backup: ${backupRoot}`); }
+  const agents = detectedHarnesses().filter((item) => item.installed && item.npxAgent).map((item) => item.npxAgent!);
+  const backupRoot = backup([...globalSkillLocks(), canonicalSkills, skillManifestPath]);
+  try {
+    for (const name of tracked) {
+      const item = manifest.skills[name];
+      run(["npx", "--yes", "skills", "add", item.source!, "--skill", name, ...(item.fullDepth ? ["--full-depth"] : []), "-g", "-y", "--agent", ...agents]);
+    }
+    const refreshed = scanSkillManifest(canonicalSkills, globalSkillLocks(), manifest);
+    for (const name of tracked) refreshed.skills[name].provenance = "install";
+    writeJsonAtomic(skillManifestPath, refreshed);
+    cleanOldBackups();
+    console.log(`Applied ${tracked.length} update(s). Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
+  }
   catch (error) { restoreBackup(backupRoot); throw new Error(`update failed; rolled back from ${backupRoot}: ${(error as Error).message}`); }
+}
+
+function initState(args: string[]): void {
+  const apply = applyRequired(args);
+  const previous = readSkillManifest();
+  const skillManifest = scanSkillManifest(canonicalSkills, globalSkillLocks(), previous);
+  const mcpManifest = scanMcpManifest(mcpSources(), readMcpManifest());
+  const knownSkills = Object.values(skillManifest.skills).filter((item) => item.source).length;
+  const knownMcps = Object.values(mcpManifest.servers).filter((item) => item.source).length;
+  const mcpConflicts = Object.values(mcpManifest.servers).filter((item) => item.conflict).length;
+  console.log(`Plan: inventory ${Object.keys(skillManifest.skills).length} canonical skill(s); known source=${knownSkills}; unknown source=${Object.keys(skillManifest.skills).length - knownSkills}`);
+  console.log(`Plan: inventory ${Object.keys(mcpManifest.servers).length} MCP server(s); known upstream=${knownMcps}; unknown upstream=${Object.keys(mcpManifest.servers).length - knownMcps}; conflicts=${mcpConflicts}`);
+  if (!apply) return;
+  const backupRoot = backup([skillManifestPath, mcpManifestPath]);
+  try {
+    writeJsonAtomic(skillManifestPath, skillManifest);
+    writeJsonAtomic(mcpManifestPath, mcpManifest);
+    cleanOldBackups();
+    console.log(`Initialized ${skillManifestPath} and ${mcpManifestPath}. Backup: ${backupRoot}`);
+  } catch (error) {
+    restoreBackup(backupRoot);
+    throw new Error(`init failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
+  }
 }
 
 function hasSecretLiterals(servers: Record<string, McpServer>): boolean {
@@ -610,6 +768,67 @@ function semanticMcp(server: McpServer): unknown {
   };
 }
 
+function mcpConfigHash(server: McpServer): string {
+  return createHash("sha256").update(JSON.stringify(semanticMcp(server))).digest("hex");
+}
+
+export function inferMcpUpstream(server: McpServer): Pick<TrackedMcp, "source" | "sourceType" | "provenance"> {
+  if (server.url) return { source: server.url, sourceType: "url", provenance: "inferred" };
+  const args = server.args ?? [];
+  if (server.command === "npx" || server.command === "bunx") {
+    const source = args.find((arg) => !arg.startsWith("-"));
+    if (source) return { source, sourceType: "npm", provenance: "inferred" };
+  }
+  if (server.command === "uvx") {
+    const source = args.find((arg) => !arg.startsWith("-"));
+    if (source) return { source, sourceType: "pypi", provenance: "inferred" };
+  }
+  if (server.command === "docker" || server.command === "podman") {
+    const runIndex = args.indexOf("run");
+    const source = args.slice(runIndex >= 0 ? runIndex + 1 : 0).find((arg) => !arg.startsWith("-") && !arg.includes("="));
+    if (source) return { source, sourceType: "docker", provenance: "inferred" };
+  }
+  return { source: null, sourceType: null, provenance: "scan" };
+}
+
+export function scanMcpManifest(
+  sources: McpSource[],
+  previous: McpManifest = { version: 1, servers: {} },
+  now = new Date().toISOString(),
+): McpManifest {
+  const found = new Map<string, Array<{ server: McpServer; installation: McpInstallation }>>();
+  for (const source of sources) {
+    if (!existsSync(source.path)) continue;
+    let servers: Record<string, McpServer>;
+    try { servers = normalizeMcpFile(source.path); } catch { continue; }
+    for (const [name, server] of Object.entries(servers)) {
+      const entries = found.get(name) ?? [];
+      entries.push({ server, installation: { harness: source.harness, path: source.path, scope: source.scope, configHash: mcpConfigHash(server) } });
+      found.set(name, entries);
+    }
+  }
+  const servers: Record<string, TrackedMcp> = {};
+  for (const [name, entries] of [...found].sort(([left], [right]) => left.localeCompare(right))) {
+    const installations = entries.map((entry) => entry.installation).sort((left, right) => `${left.scope}:${left.harness}:${left.path}`.localeCompare(`${right.scope}:${right.harness}:${right.path}`));
+    const hashes = [...new Set(installations.map((item) => item.configHash))];
+    const inferred = entries.map((entry) => inferMcpUpstream(entry.server));
+    const upstreams = [...new Set(inferred.filter((item) => item.source).map((item) => `${item.sourceType}:${item.source}`))];
+    const prior = previous.servers[name];
+    const unchanged = prior && JSON.stringify(prior.installations) === JSON.stringify(installations);
+    const selected = upstreams.length === 1 ? inferred.find((item) => item.source) : undefined;
+    servers[name] = {
+      source: selected?.source ?? null,
+      sourceType: selected?.sourceType ?? null,
+      configHash: hashes.length === 1 ? hashes[0] : null,
+      conflict: hashes.length > 1 || upstreams.length > 1,
+      installations,
+      updatedAt: unchanged ? prior.updatedAt : now,
+      provenance: selected?.provenance ?? "scan",
+    };
+  }
+  return { version: 1, servers };
+}
+
 export function sameMcpServer(left: McpServer, right: McpServer): boolean {
   return JSON.stringify(semanticMcp(left)) === JSON.stringify(semanticMcp(right));
 }
@@ -657,7 +876,7 @@ function mcpSync(args: string[]): void {
     const unsafe = targetPaths.filter((path) => !gitIgnored(path));
     if (unsafe.length) fail(`secret-bearing project configs must be gitignored: ${unsafe.join(", ")}`);
   }
-  const backupRoot = backup(targetPaths);
+  const backupRoot = backup([...targetPaths, mcpManifestPath]);
   try {
     for (const harness of ["codex", "opencode", "hermes", "goose"]) {
       const path = mcpTargetPath(harness, effectiveScope);
@@ -681,8 +900,9 @@ function mcpSync(args: string[]): void {
         run(["gemini", "mcp", "add", "--scope", targetScope, "--transport", transport, ...envArgs, ...headerArgs, item.name, ...(server.url ? [server.url] : [server.command!, ...(server.args ?? [])])]);
       }
     }
+    writeJsonAtomic(mcpManifestPath, scanMcpManifest(mcpSources(), readMcpManifest()));
     cleanOldBackups();
-    console.log(`Applied ${missing.length} MCP binding(s). Backup: ${backupRoot}`);
+    console.log(`Applied ${missing.length} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
   } catch (error) {
     restoreBackup(backupRoot);
     throw new Error(`MCP sync failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
@@ -690,7 +910,7 @@ function mcpSync(args: string[]): void {
 }
 
 function usage(): void {
-  console.log(`harness-sync [audit|instructions|add|remove|update|mcp]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
+  console.log(`harness-sync [audit|init|instructions|add|remove|update|mcp]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
 }
 
 export function main(argv = process.argv.slice(2)): void {
@@ -698,6 +918,7 @@ export function main(argv = process.argv.slice(2)): void {
   try {
     if (!command) return usage();
     if (command === "audit") return audit(args.includes("--json"));
+    if (command === "init") return initState(args);
     if (command === "instructions") return syncInstructions(args);
     if (command === "add") return addSkill(args);
     if (command === "remove") return removeSkill(args[0] ?? "", args.slice(1));
