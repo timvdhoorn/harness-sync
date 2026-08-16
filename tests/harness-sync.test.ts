@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inferMcpScope, inspectInstructions, inspectSkillDirectory, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, removalTargets, renderDirectTarget, sameMcpServer, validSkillName } from "../scripts/harness-sync";
+import { discoverMarketplaceSkills, inferMcpScope, inspectInstructions, inspectSkillDirectory, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, removalTargets, renderDirectTarget, sameMcpServer, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -59,6 +59,24 @@ describe("skill audit", () => {
     writeFileSync(join(target, "demo", "SKILL.md"), "---\nname: demo\n---\nchanged");
     symlinkSync("missing", join(target, "broken"));
     expect(inspectSkillDirectory(target, canonical).map((item) => item.issue)).toEqual(["broken-skill-link", "copy-drift"]);
+  });
+
+  test("deduplicates marketplace skills and marks canonical conflicts", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const canonical = join(root, "canonical");
+    const claude = join(root, "claude", "market", "plugin", "1", "skills", "demo");
+    const codex = join(root, "codex", "market", "plugin", "1", "skills", "demo");
+    mkdirSync(join(canonical, "demo"), { recursive: true });
+    mkdirSync(claude, { recursive: true });
+    mkdirSync(codex, { recursive: true });
+    writeFileSync(join(canonical, "demo", "SKILL.md"), "canonical");
+    writeFileSync(join(claude, "SKILL.md"), "marketplace");
+    writeFileSync(join(codex, "SKILL.md"), "marketplace");
+    const found = discoverMarketplaceSkills([{ harness: "claude", path: join(root, "claude") }, { harness: "codex", path: join(root, "codex") }], canonical);
+    expect(found).toHaveLength(1);
+    expect(found[0].status).toBe("conflict");
+    expect(found[0].sources).toHaveLength(2);
   });
 });
 

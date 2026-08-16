@@ -21,6 +21,8 @@ In projects, `AGENTS.md` is canonical and `CLAUDE.md` is a relative symlink to i
 
 Accept local paths, GitHub/GitLab repositories and tree URLs, arbitrary git URLs supported by `npx skills`, direct skill/archive URLs, `skills.sh/<owner>/<repo>/<skill>`, and allowlisted `npx skills add ...` commands. Local sources copy by default; link only when explicitly requested.
 
+Marketplace discovery is read-only. Deduplicate identical cached skills across Claude, Codex, and Grok. Native plugin remains recommended when the plugin also supplies hooks, MCP, agents, or other resources. Copy only the selected standalone skill through the existing `add` flow after confirmation.
+
 ## MCP
 
 Default source and scope are `auto`. Sources may be Codex or Grok TOML; Claude, OpenCode, or Gemini JSON/JSONC; Hermes or Goose YAML; or an explicit path. Prefer project sources, then global sources. Infer an explicit path inside the Git root as project scope. Never silently change project/global scope. Hermes and Goose have no native project scope; report that limitation instead of writing globally.

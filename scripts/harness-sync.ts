@@ -18,7 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 export type McpServer = {
   command?: string;
@@ -41,6 +41,7 @@ type Harness = {
 
 type McpSource = { harness: string; path: string; scope: "project" | "global" };
 type SkillIssue = { path: string; issue: string };
+type MarketplaceSkill = { name: string; hash: string; status: "available" | "canonical" | "conflict"; sources: Array<{ harness: string; marketplace: string; plugin: string; path: string }> };
 
 const home = homedir();
 const stateRoot = process.env.XDG_STATE_HOME
@@ -173,31 +174,8 @@ export function validSkillName(name: string): boolean {
   return /^[a-z0-9][a-z0-9-]{0,63}$/.test(name);
 }
 
-function detectedHarnesses(): Array<Harness & { installed: boolean; skillStatus: string }> {
-  return harnesses.map((harness) => {
-    const installed = commandExists(harness.executable);
-    let skillStatus = "missing";
-    if (existsSync(harness.skillDir)) {
-      const info = lstatSync(harness.skillDir);
-      if (info.isSymbolicLink()) {
-        try {
-          skillStatus = realpathSync(harness.skillDir) === realpathSync(canonicalSkills) ? "canonical-link" : `wrong-link:${readlinkSync(harness.skillDir)}`;
-        } catch {
-          skillStatus = "broken-link";
-        }
-      } else if (info.isDirectory()) {
-        let broken = 0;
-        for (const entry of readdirSync(harness.skillDir)) {
-          const path = join(harness.skillDir, entry);
-          if (lstatSync(path).isSymbolicLink()) {
-            try { realpathSync(path); } catch { broken += 1; }
-          }
-        }
-        skillStatus = broken ? `directory:${broken}-broken-links` : "directory";
-      }
-    }
-    return { ...harness, installed, skillStatus };
-  });
+function detectedHarnesses(): Array<Harness & { installed: boolean }> {
+  return harnesses.map((harness) => ({ ...harness, installed: commandExists(harness.executable) }));
 }
 
 export function inspectSkillDirectory(skillDir: string, canonicalDir = canonicalSkills): SkillIssue[] {
@@ -233,6 +211,37 @@ export function inspectSkillDirectory(skillDir: string, canonicalDir = canonical
     }
   }
   return issues;
+}
+
+export function discoverMarketplaceSkills(
+  roots: Array<{ harness: string; path: string }> = [
+    { harness: "claude", path: join(home, ".claude", "plugins", "cache") },
+    { harness: "codex", path: join(home, ".codex", "plugins", "cache") },
+    { harness: "grok", path: join(home, ".grok", "plugins", "marketplaces") },
+  ],
+  canonicalDir = canonicalSkills,
+): MarketplaceSkill[] {
+  const grouped = new Map<string, MarketplaceSkill>();
+  const visit = (root: { harness: string; path: string }, path: string, depth: number) => {
+    if (depth > 8) return;
+    for (const name of readdirSync(path).sort()) {
+      const child = join(path, name);
+      if (!lstatSync(child).isDirectory()) continue;
+      const skillFile = join(child, "SKILL.md");
+      if (existsSync(skillFile)) {
+        const hash = createHash("sha256").update(readFileSync(skillFile)).digest("hex");
+        const key = `${name}:${hash}`;
+        const canonicalFile = join(canonicalDir, name, "SKILL.md");
+        const canonicalHash = existsSync(canonicalFile) ? createHash("sha256").update(readFileSync(canonicalFile)).digest("hex") : "";
+        const parts = relative(root.path, child).split("/");
+        const item = grouped.get(key) ?? { name, hash, status: canonicalHash === hash ? "canonical" : canonicalHash ? "conflict" : "available", sources: [] };
+        item.sources.push({ harness: root.harness, marketplace: parts[0] ?? "unknown", plugin: parts[1] ?? name, path: child });
+        grouped.set(key, item);
+      } else visit(root, child, depth + 1);
+    }
+  };
+  for (const root of roots) if (existsSync(root.path)) visit(root, root.path, 0);
+  return [...grouped.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function normalizeMcpMap(raw: Record<string, any>): Record<string, McpServer> {
@@ -347,15 +356,18 @@ function audit(asJson: boolean): void {
       return issue ? [{ path, issue }] : [];
     })
     : [{ path: canonicalSkills, issue: "missing-directory" }];
-  const skills = detectedHarnesses().map(({ id, installed, skillDir, skillStatus }) => ({ id, installed, skillDir, skillStatus, issues: inspectSkillDirectory(skillDir) }));
+  const skills = detectedHarnesses().map(({ id, installed, skillDir }) => ({ id, installed, skillDir, issues: inspectSkillDirectory(skillDir) }));
+  const marketplaceSkills = discoverMarketplaceSkills();
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
   const instructions = instructionTargets("all");
-  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, mcp, instructions };
+  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, instructions };
   if (asJson) console.log(JSON.stringify(result, null, 2));
   else {
     console.log(`Canonical skills: ${canonicalSkills} (${result.canonicalExists ? "ok" : "missing"})`);
     if (canonicalIssues.length) console.log(`canonical issues: ${canonicalIssues.length}`);
-    for (const item of skills) console.log(`${item.id}: ${item.installed ? "installed" : "config-only"}; skills=${item.skillStatus}; issues=${item.issues.length}`);
+    for (const item of skills) console.log(`${item.id}: ${item.installed ? "installed" : "config-only"}; skill-issues=${item.issues.length}`);
+    const candidates = marketplaceSkills.filter((item) => item.status !== "canonical");
+    console.log(`marketplace skills: ${marketplaceSkills.length}; choices=${candidates.length}`);
     for (const item of mcp) console.log(`${item.harness}: ${item.servers.length} MCP server(s) in ${item.path}`);
     for (const item of instructions) console.log(`instructions ${item.root}: ${item.status}`);
   }

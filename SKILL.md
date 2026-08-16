@@ -37,3 +37,5 @@ Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands
 Read [references/behavior.md](references/behavior.md) only when resolving source, MCP, platform, ownership, or recovery details.
 
 For `instructions`, include the project and user home by default. A real `CLAUDE.md` is a conflict: explain that it will be backed up and require separate confirmation before using `--replace`.
+
+`audit` also finds skills inside Claude, Codex, and Grok marketplace caches. When the user asks about one, show its marketplace/plugin and ask: keep the native plugin (recommended), copy this skill through existing `add`, or ignore. Never bulk-copy. Explain conflicts before replacing a canonical skill.
