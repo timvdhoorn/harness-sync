@@ -27,13 +27,13 @@ Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands
 
 ## Commands
 
-- `audit` — inspect skill links, broken targets, copies, content drift, `SKILL.md` frontmatter/names, instruction links, MCP files, and MCP provenance/conflicts.
+- `audit` — inspect skill links, broken targets, copies, content drift, `SKILL.md` frontmatter/names, instruction links, MCP files, indirect launchers, and MCP provenance/conflicts.
 - `init` — scan canonical skills and MCP servers into separate provenance manifests; import skill locks and infer MCP upstreams from URLs and recognized package/container launchers.
 - `instructions [--scope project|user|all]` — make `AGENTS.md` canonical and link `CLAUDE.md` to it.
 - `add <source|npx skills add ...>` — accept repository/tree/direct URLs, `skills.sh` URLs, local paths, and `npx skills add` commands.
 - `remove <skill>` — remove any found skill from canonical storage and every detected harness.
 - `update [skill ...]` — plan or reinstall tracked global skills from their recorded source; unknown sources are skipped unless explicitly requested.
-- `mcp [--from auto|codex|claude|grok|opencode|gemini|hermes|goose|<path>] [--target <harness>] [--scope auto|project|global]` — semantically compare and render MCP servers across detected harnesses.
+- `mcp [--from auto|catalog|codex|claude|pi|grok|opencode|gemini|hermes|goose|<path>] [--target <harness>]... [--scope auto|project|global] [--resolve <server>=source|target:<harness>|merge|skip]` — build a secret-free MCP plan and render reviewed definitions in selected native targets. Add `--direct` only when a proven-equal Codex Pi wrapper should be replaced by the direct definition.
 
 Read [references/behavior.md](references/behavior.md) only when resolving source, MCP, platform, ownership, or recovery details.
 

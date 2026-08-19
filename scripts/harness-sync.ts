@@ -18,7 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 export type McpServer = {
   command?: string;
@@ -39,7 +39,7 @@ type Harness = {
   npxAgent?: string;
 };
 
-type McpSource = { harness: string; path: string; scope: "project" | "global" };
+export type McpSource = { harness: string; path: string; scope: "project" | "global" };
 type SkillIssue = { path: string; issue: string };
 type MarketplaceSkill = { name: string; hash: string; status: "available" | "canonical" | "conflict"; sources: Array<{ harness: string; marketplace: string; plugin: string; path: string }> };
 export type TrackedSkill = {
@@ -55,7 +55,24 @@ export type TrackedSkill = {
   provenance: "install" | "lock-import" | "scan";
 };
 export type SkillManifest = { version: 1; skills: Record<string, TrackedSkill> };
-export type McpInstallation = { harness: string; path: string; scope: "project" | "global"; configHash: string };
+export type McpInstallation = {
+  harness: string;
+  path: string;
+  scope: "project" | "global";
+  configHash: string;
+  effectiveConfigHash?: string;
+  indirection?: { harness: "pi"; server: string; path: string };
+};
+export type McpAuditIssue = {
+  issue: "non-portable-path" | "harness-coupled-launcher" | "missing-pi-server";
+  harness: string;
+  path: string;
+  server: string;
+  field: string;
+  value: string;
+  indirectHarnesses: string[];
+  targetPath?: string;
+};
 export type TrackedMcp = {
   source: string | null;
   sourceType: "url" | "npm" | "pypi" | "docker" | null;
@@ -66,6 +83,37 @@ export type TrackedMcp = {
   provenance: "inferred" | "scan";
 };
 export type McpManifest = { version: 1; servers: Record<string, TrackedMcp> };
+export type McpTargetBinding = McpSource & { servers: Record<string, McpServer>; managedWrappers?: string[] };
+export type McpResolution = { action: "variant" | "merge" | "skip"; variant?: string };
+export type McpSyncPlan = {
+  version: 1;
+  mode: "interactive" | "non-interactive";
+  apply: boolean;
+  status: "ready-for-review" | "blocked-by-conflict";
+  inventory: { source: string; identical: string[]; missing: string[]; conflicts: string[]; unrelated: string[] };
+  operations: Array<{
+    server: string;
+    resolution: "identical" | "source" | "variant" | "reviewed-merge";
+    definitionSource: string;
+    targets: Array<{ binding: string; path: string; renderer: string }>;
+    differingFields: string[];
+    envKeys: string[];
+    headerKeys: string[];
+    preserve: string[];
+  }>;
+  unresolvedConflicts: Array<{
+    server: string;
+    variants: Array<{ id: string; harness: string; path: string }>;
+    differingFields: string[];
+    envKeys: string[];
+    headerKeys: string[];
+    collisions: string[];
+  }>;
+  skippedConflicts: string[];
+  writes: [];
+  requiresSeparateApplyConsent: boolean;
+  exitCode: number;
+};
 
 const home = homedir();
 const stateRoot = process.env.XDG_STATE_HOME
@@ -79,7 +127,7 @@ const cwd = process.cwd();
 export const harnesses: Harness[] = [
   { id: "codex", executable: "codex", skillDir: join(home, ".codex", "skills"), mcpFiles: [join(home, ".codex", "config.toml")], npxAgent: "codex" },
   { id: "claude", executable: "claude", skillDir: join(home, ".claude", "skills"), mcpFiles: [join(cwd, ".mcp.json"), join(home, ".claude.json")], npxAgent: "claude-code" },
-  { id: "pi", executable: "pi", skillDir: join(home, ".pi", "agent", "skills"), mcpFiles: [], npxAgent: "pi" },
+  { id: "pi", executable: "pi", skillDir: join(home, ".pi", "agent", "skills"), mcpFiles: [join(home, ".pi", "mcp", "mcp.json")], npxAgent: "pi" },
   { id: "grok", executable: "grok", skillDir: join(home, ".grok", "skills"), mcpFiles: [join(cwd, ".grok", "config.toml"), join(home, ".grok", "config.toml")], npxAgent: "grok" },
   { id: "opencode", executable: "opencode", skillDir: join(home, ".config", "opencode", "skills"), mcpFiles: [join(cwd, ".opencode", "opencode.json"), join(home, ".config", "opencode", "opencode.json")], npxAgent: "opencode" },
   { id: "gemini", executable: "gemini", skillDir: join(home, ".gemini", "skills"), mcpFiles: [join(cwd, ".gemini", "settings.json"), join(home, ".gemini", "settings.json")], npxAgent: "gemini-cli" },
@@ -375,6 +423,93 @@ function mcpInventory(path: string): string[] {
   try { return Object.keys(normalizeMcpFile(path)); } catch { return []; }
 }
 
+export function piServerReference(server: McpServer): string | undefined {
+  if (!server.command || basename(server.command) !== "agent-mcp-from-pi") return undefined;
+  if (server.url || server.args?.length !== 1 || !server.args[0]) return undefined;
+  return server.args[0];
+}
+
+function nonPortablePathValues(value: string, currentPlatform: NodeJS.Platform): string[] {
+  if (currentPlatform !== "linux" || value === "~" || value.startsWith("~/")) return [];
+  return value.match(/\/Users\/[^/:\s]+(?:\/[^:\n]*)?|\/opt\/homebrew(?:\/[^:\n]*)?/g) ?? [];
+}
+
+function harnessCoupledLauncherValues(value: string): string[] {
+  return value.match(/(?:\$HOME|~|\/Users\/[^/:\s]+|\/home\/[^/:\s]+)\/\.agents\/(?:codex|claude|pi|grok|opencode|gemini|hermes|goose)\/[A-Za-z0-9._/-]+/g) ?? [];
+}
+
+export function inspectMcpConfigurations(
+  sources: McpSource[],
+  currentPlatform: NodeJS.Platform = platform(),
+): McpAuditIssue[] {
+  const loaded = sources.flatMap((source) => {
+    if (!existsSync(source.path)) return [];
+    try { return [{ source, servers: normalizeMcpFile(source.path) }]; } catch { return []; }
+  });
+  const pi = loaded.find((item) => item.source.harness === "pi" && item.source.scope === "global");
+  const dependents = new Map<string, string[]>();
+  const issues: McpAuditIssue[] = [];
+
+  for (const item of loaded.filter((entry) => entry.source.harness === "codex")) {
+    for (const [name, server] of Object.entries(item.servers)) {
+      const reference = piServerReference(server);
+      if (!reference) continue;
+      const dependent = `${item.source.harness}:${name}`;
+      dependents.set(reference, [...(dependents.get(reference) ?? []), dependent]);
+      if (!pi?.servers[reference]) {
+        issues.push({
+          issue: "missing-pi-server",
+          harness: item.source.harness,
+          path: item.source.path,
+          server: name,
+          field: "args[0]",
+          value: reference,
+          indirectHarnesses: [dependent],
+          targetPath: pi?.source.path ?? join(home, ".pi", "mcp", "mcp.json"),
+        });
+      }
+    }
+  }
+
+  for (const item of loaded) {
+    for (const [name, server] of Object.entries(item.servers)) {
+      const fields: Array<[string, string]> = [
+        ...(server.command ? [["command", server.command] as [string, string]] : []),
+        ...(server.args ?? []).map((value, index) => [`args[${index}]`, value] as [string, string]),
+        ...(server.cwd ? [["cwd", server.cwd] as [string, string]] : []),
+        ...Object.entries(server.env ?? {})
+          .filter(([key]) => !/(?:token|secret|password|passwd|api[_-]?key|authorization|credential)/i.test(key))
+          .map(([key, value]) => [`env.${key}`, value] as [string, string]),
+      ];
+      for (const [field, value] of fields) {
+        for (const launcher of harnessCoupledLauncherValues(value)) {
+          issues.push({
+            issue: "harness-coupled-launcher",
+            harness: item.source.harness,
+            path: item.source.path,
+            server: name,
+            field,
+            value: launcher,
+            indirectHarnesses: [],
+          });
+        }
+        for (const offendingPath of nonPortablePathValues(value, currentPlatform)) {
+          issues.push({
+            issue: "non-portable-path",
+            harness: item.source.harness,
+            path: item.source.path,
+            server: name,
+            field,
+            value: offendingPath,
+            indirectHarnesses: item.source.harness === "pi" ? [...new Set(dependents.get(name) ?? [])].sort() : [],
+          });
+        }
+      }
+    }
+  }
+  return issues.sort((left, right) => `${left.path}:${left.server}:${left.field}`.localeCompare(`${right.path}:${right.server}:${right.field}`));
+}
+
 type InstructionsStatus = {
   root: string;
   agents: string;
@@ -449,6 +584,7 @@ function audit(asJson: boolean): void {
   const marketplaceSkills = discoverMarketplaceSkills();
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
   const mcpManifest = scanMcpManifest(mcpSources(), readMcpManifest());
+  const mcpIssues = inspectMcpConfigurations(mcpSources());
   const mcpProvenance = {
     path: mcpManifestPath,
     exists: existsSync(mcpManifestPath),
@@ -458,7 +594,7 @@ function audit(asJson: boolean): void {
     conflicts: Object.entries(mcpManifest.servers).filter(([, item]) => item.conflict).map(([name]) => name),
   };
   const instructions = instructionTargets("all");
-  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, instructions };
+  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, mcpIssues, instructions };
   if (asJson) console.log(JSON.stringify(result, null, 2));
   else {
     console.log(`Canonical skills: ${canonicalSkills} (${result.canonicalExists ? "ok" : "missing"})`);
@@ -468,6 +604,15 @@ function audit(asJson: boolean): void {
     console.log(`marketplace skills: ${marketplaceSkills.length}; choices=${candidates.length}`);
     for (const item of mcp) console.log(`${item.harness}: ${item.servers.length} MCP server(s) in ${item.path}`);
     console.log(`MCP provenance: ${mcpProvenance.exists ? "initialized" : "missing"}; servers=${mcpProvenance.servers}; known=${mcpProvenance.known}; unknown=${mcpProvenance.unknown}; conflicts=${mcpProvenance.conflicts.length}`);
+    for (const item of mcpIssues) {
+      if (item.issue === "missing-pi-server") {
+        console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} references missing Pi server in ${item.targetPath}; indirect harnesses=${item.indirectHarnesses.join(", ")}`);
+      } else if (item.issue === "harness-coupled-launcher") {
+        console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} depends on a harness-specific launcher`);
+      } else {
+        console.log(`MCP portability: ${item.path}: ${item.server} ${item.field}=${item.value} is not portable on ${platform()}; indirect harnesses=${item.indirectHarnesses.join(", ") || "none"}`);
+      }
+    }
     for (const item of instructions) console.log(`instructions ${item.root}: ${item.status}`);
   }
 }
@@ -658,6 +803,8 @@ function mcpSources(): McpSource[] {
     { harness: "opencode", path: join(root, "opencode.json"), scope: "project" },
     { harness: "opencode", path: join(root, ".opencode", "opencode.json"), scope: "project" },
     { harness: "gemini", path: join(root, ".gemini", "settings.json"), scope: "project" },
+    { harness: "catalog", path: join(root, "mcp.json"), scope: "project" },
+    { harness: "pi", path: join(home, ".pi", "mcp", "mcp.json"), scope: "global" },
     { harness: "claude", path: join(home, ".claude.json"), scope: "global" },
     { harness: "codex", path: join(home, ".codex", "config.toml"), scope: "global" },
     { harness: "grok", path: join(home, ".grok", "config.toml"), scope: "global" },
@@ -676,30 +823,71 @@ function mcpTargetPath(harness: string, scope: "project" | "global"): string | u
     grok: { project: join(root, ".grok", "config.toml"), global: join(home, ".grok", "config.toml") },
     opencode: { project: join(root, "opencode.json"), global: join(home, ".config", "opencode", "opencode.json") },
     gemini: { project: join(root, ".gemini", "settings.json"), global: join(home, ".gemini", "settings.json") },
+    pi: { global: join(home, ".pi", "mcp", "mcp.json") },
     hermes: { global: join(home, ".hermes", "config.yaml") },
     goose: { global: join(home, ".config", "goose", "config.yaml") },
+    catalog: { project: join(root, "mcp.json"), global: "" },
   };
-  return paths[harness]?.[scope];
+  return paths[harness]?.[scope] || undefined;
+}
+
+function codexSection(header: string): { server: string; field?: string } | undefined {
+  const match = header.match(/^mcp_servers\.(?:"((?:\\.|[^"])*)"|'([^']*)'|([A-Za-z0-9_-]+))(?:\.(env|http_headers))?$/);
+  if (!match) return undefined;
+  const server = match[1] !== undefined ? JSON.parse(`"${match[1]}"`) : match[2] ?? match[3];
+  return { server, ...(match[4] ? { field: match[4] } : {}) };
+}
+
+function codexServerBlock(name: string, server: McpServer, unknownRoot: string[] = []): string {
+  const line = (key: string, value: unknown) => `${key} = ${JSON.stringify(value)}`;
+  const section = JSON.stringify(name);
+  const values = [
+    server.url ? line("url", server.url) : line("command", server.command),
+    ...(server.args?.length ? [line("args", server.args)] : []),
+    ...(server.cwd ? [line("cwd", server.cwd)] : []),
+    line("enabled", server.enabled !== false),
+    ...unknownRoot,
+  ];
+  let text = `[mcp_servers.${section}]\n${values.join("\n")}`;
+  for (const [field, entries] of [["env", server.env], ["http_headers", server.headers]] as const) {
+    if (!entries || !Object.keys(entries).length) continue;
+    text += `\n\n[mcp_servers.${section}.${field}]\n${Object.entries(entries).map(([key, value]) => line(JSON.stringify(key), value)).join("\n")}`;
+  }
+  return text;
+}
+
+function updateCodexServer(text: string, name: string, server: McpServer): string {
+  const sections = text.trimEnd().split(/(?=^\s*\[[^\]]+\]\s*$)/m);
+  const kept: string[] = [];
+  const unknownRoot: string[] = [];
+  for (const section of sections) {
+    const lines = section.trim().split("\n");
+    const header = lines[0]?.trim().match(/^\[([^\]]+)\]$/)?.[1];
+    const parsed = header ? codexSection(header) : undefined;
+    if (parsed?.server !== name) {
+      if (section.trim()) kept.push(section.trim());
+      continue;
+    }
+    if (parsed.field === "env" || parsed.field === "http_headers") continue;
+    if (!parsed.field) {
+      unknownRoot.push(...lines.slice(1).filter((line) => !/^\s*(?:command|args|cwd|url|enabled)\s*=/.test(line)));
+      continue;
+    }
+    kept.push(section.trim());
+  }
+  kept.push(codexServerBlock(name, server, unknownRoot));
+  return `${kept.filter(Boolean).join("\n\n")}\n`;
 }
 
 function renderCodex(path: string, servers: Record<string, McpServer>): void {
-  let text = existsSync(path) ? readFileSync(path, "utf8").trimEnd() : "";
-  const line = (key: string, value: unknown) => `${key} = ${JSON.stringify(value)}`;
-  for (const [name, server] of Object.entries(servers)) {
-    const section = JSON.stringify(name);
-    const values = [
-      server.url ? line("url", server.url) : line("command", server.command),
-      ...(server.args?.length ? [line("args", server.args)] : []),
-      ...(server.cwd ? [line("cwd", server.cwd)] : []),
-      line("enabled", server.enabled !== false),
-    ];
-    text += `${text ? "\n\n" : ""}[mcp_servers.${section}]\n${values.join("\n")}`;
-    for (const [field, entries] of [["env", server.env], ["http_headers", server.headers]] as const) {
-      if (!entries || !Object.keys(entries).length) continue;
-      text += `\n\n[mcp_servers.${section}.${field}]\n${Object.entries(entries).map(([key, value]) => line(JSON.stringify(key), value)).join("\n")}`;
-    }
-  }
-  writeTextAtomic(path, `${text}\n`);
+  let text = existsSync(path) ? readFileSync(path, "utf8") : "";
+  for (const [name, server] of Object.entries(servers)) text = updateCodexServer(text, name, server);
+  writeTextAtomic(path, text);
+}
+
+function preserveUnknown(existing: unknown, known: string[]): Record<string, unknown> {
+  if (!existing || typeof existing !== "object" || Array.isArray(existing)) return {};
+  return Object.fromEntries(Object.entries(existing as Record<string, unknown>).filter(([key]) => !known.includes(key)));
 }
 
 function renderOpenCode(path: string, servers: Record<string, McpServer>): void {
@@ -707,9 +895,32 @@ function renderOpenCode(path: string, servers: Record<string, McpServer>): void 
   const v2 = Boolean(json.mcp?.servers);
   const target = v2 ? (json.mcp.servers ??= {}) : (json.mcp ??= {});
   for (const [name, server] of Object.entries(servers)) {
+    const unknown = preserveUnknown(target[name], ["type", "command", "args", "cwd", "env", "environment", "envs", "url", "uri", "headers", "http_headers", "enabled", "disabled"]);
     target[name] = server.url
-      ? { type: "remote", url: server.url, ...(server.headers ? { headers: server.headers } : {}), ...(v2 ? { disabled: server.enabled === false } : { enabled: server.enabled !== false }) }
-      : { type: "local", command: [server.command, ...(server.args ?? [])], ...(server.cwd ? { cwd: server.cwd } : {}), ...(server.env ? { environment: server.env } : {}), ...(v2 ? { disabled: server.enabled === false } : { enabled: server.enabled !== false }) };
+      ? { ...unknown, type: "remote", url: server.url, ...(server.headers ? { headers: server.headers } : {}), ...(v2 ? { disabled: server.enabled === false } : { enabled: server.enabled !== false }) }
+      : { ...unknown, type: "local", command: [server.command, ...(server.args ?? [])], ...(server.cwd ? { cwd: server.cwd } : {}), ...(server.env ? { environment: server.env } : {}), ...(v2 ? { disabled: server.enabled === false } : { enabled: server.enabled !== false }) };
+  }
+  writeJsonAtomic(path, json);
+}
+
+function renderPi(path: string, servers: Record<string, McpServer>): void {
+  const json: any = existsSync(path) ? readJson(path) : {};
+  const target = json.mcpServers && typeof json.mcpServers === "object"
+    ? json.mcpServers
+    : json.mcp?.servers && typeof json.mcp.servers === "object"
+      ? json.mcp.servers
+      : json.mcp && typeof json.mcp === "object"
+        ? json.mcp
+        : (json.mcpServers = {});
+  for (const [name, server] of Object.entries(servers)) {
+    const existing = preserveUnknown(target[name], ["type", "command", "cmd", "args", "cwd", "env", "environment", "envs", "url", "uri", "headers", "http_headers", "enabled", "disabled"]);
+    target[name] = {
+      ...existing,
+      ...(server.url
+        ? { type: server.type ?? "http", url: server.url, ...(server.headers ? { headers: server.headers } : {}) }
+        : { type: "stdio", command: server.command, args: server.args ?? [], ...(server.cwd ? { cwd: server.cwd } : {}), ...(server.env ? { env: server.env } : {}) }),
+      ...(server.enabled === false ? { enabled: false } : {}),
+    };
   }
   writeJsonAtomic(path, json);
 }
@@ -718,31 +929,35 @@ function renderYamlTarget(path: string, harness: "hermes" | "goose", servers: Re
   const yaml: any = existsSync(path) ? Bun.YAML.parse(readFileSync(path, "utf8")) : {};
   const target = harness === "hermes" ? (yaml.mcp_servers ??= {}) : (yaml.extensions ??= {});
   for (const [name, server] of Object.entries(servers)) {
+    const unknown = preserveUnknown(target[name], ["name", "type", "command", "cmd", "args", "cwd", "env", "environment", "envs", "url", "uri", "headers", "http_headers", "enabled", "disabled"]);
     target[name] = harness === "hermes"
-      ? { ...(server.url ? { url: server.url } : { command: server.command, args: server.args ?? [] }), ...(server.env ? { env: server.env } : {}), ...(server.headers ? { headers: server.headers } : {}), enabled: server.enabled !== false }
-      : { name, type: server.url ? "streamable_http" : "stdio", enabled: server.enabled !== false, ...(server.url ? { uri: server.url, ...(server.headers ? { headers: server.headers } : {}) } : { cmd: server.command, args: server.args ?? [], ...(server.env ? { envs: server.env } : {}) }) };
+      ? { ...unknown, ...(server.url ? { url: server.url } : { command: server.command, args: server.args ?? [] }), ...(server.env ? { env: server.env } : {}), ...(server.headers ? { headers: server.headers } : {}), enabled: server.enabled !== false }
+      : { ...unknown, name, type: server.url ? "streamable_http" : "stdio", enabled: server.enabled !== false, ...(server.url ? { uri: server.url, ...(server.headers ? { headers: server.headers } : {}) } : { cmd: server.command, args: server.args ?? [], ...(server.env ? { envs: server.env } : {}) }) };
   }
   writeTextAtomic(path, Bun.YAML.stringify(yaml));
 }
 
 export function renderDirectTarget(harness: string, path: string, servers: Record<string, McpServer>): void {
   if (harness === "codex") return renderCodex(path, servers);
+  if (harness === "pi" || harness === "catalog") return renderPi(path, servers);
   if (harness === "opencode") return renderOpenCode(path, servers);
   if (harness === "hermes" || harness === "goose") return renderYamlTarget(path, harness, servers);
   fail(`no direct MCP renderer for ${harness}`);
 }
 
-function sourceForMcp(from: string, scope: string): McpSource {
-  const directPath = isAbsolute(from) || from.startsWith(".") ? resolve(cwd, from) : "";
+export function sourceForMcp(from: string, scope: string, sources = mcpSources(), base = cwd): McpSource {
+  const looksLikePath = isAbsolute(from) || from.startsWith(".") || from.includes("/") || /\.(?:jsonc?|toml|ya?ml)$/i.test(from);
+  const directPath = looksLikePath ? resolve(base, from) : "";
   if (directPath) {
     if (!existsSync(directPath)) fail(`MCP source not found: ${directPath}`);
     return { harness: "file", path: directPath, scope: scope === "auto" ? inferMcpScope(directPath, projectRoot()) : scope as "project" | "global" };
   }
-  const choices = mcpSources().filter((source) =>
+  const choices = sources.filter((source) =>
     existsSync(source.path)
     && Object.keys(normalizeMcpFile(source.path)).length > 0
     && (scope === "auto" || source.scope === scope)
     && (from === "auto" || source.harness === from)
+    && (from !== "auto" || source.harness !== "catalog")
   );
   if (!choices.length) fail(`no supported ${scope} MCP source found for ${from}`);
   return choices[0];
@@ -796,23 +1011,45 @@ export function scanMcpManifest(
   previous: McpManifest = { version: 1, servers: {} },
   now = new Date().toISOString(),
 ): McpManifest {
+  const loaded = sources.flatMap((source) => {
+    if (!existsSync(source.path)) return [];
+    try { return [{ source, servers: normalizeMcpFile(source.path) }]; } catch { return []; }
+  });
+  const pi = loaded.find((item) => item.source.harness === "pi" && item.source.scope === "global");
   const found = new Map<string, Array<{ server: McpServer; installation: McpInstallation }>>();
-  for (const source of sources) {
-    if (!existsSync(source.path)) continue;
-    let servers: Record<string, McpServer>;
-    try { servers = normalizeMcpFile(source.path); } catch { continue; }
-    for (const [name, server] of Object.entries(servers)) {
+  for (const { source, servers } of loaded) {
+    for (const [name, rawServer] of Object.entries(servers)) {
+      const reference = source.harness === "codex" ? piServerReference(rawServer) : undefined;
+      const effectiveServer = reference && pi?.servers[reference] ? pi.servers[reference] : rawServer;
       const entries = found.get(name) ?? [];
-      entries.push({ server, installation: { harness: source.harness, path: source.path, scope: source.scope, configHash: mcpConfigHash(server) } });
+      entries.push({
+        server: effectiveServer,
+        installation: {
+          harness: source.harness,
+          path: source.path,
+          scope: source.scope,
+          configHash: mcpConfigHash(rawServer),
+          ...(effectiveServer !== rawServer ? {
+            effectiveConfigHash: mcpConfigHash(effectiveServer),
+            indirection: { harness: "pi", server: reference!, path: pi!.source.path },
+          } : {}),
+        },
+      });
       found.set(name, entries);
     }
   }
   const servers: Record<string, TrackedMcp> = {};
   for (const [name, entries] of [...found].sort(([left], [right]) => left.localeCompare(right))) {
     const installations = entries.map((entry) => entry.installation).sort((left, right) => `${left.scope}:${left.harness}:${left.path}`.localeCompare(`${right.scope}:${right.harness}:${right.path}`));
-    const hashes = [...new Set(installations.map((item) => item.configHash))];
+    const hashes = [...new Set(installations.map((item) => item.effectiveConfigHash ?? item.configHash))];
     const inferred = entries.map((entry) => inferMcpUpstream(entry.server));
     const upstreams = [...new Set(inferred.filter((item) => item.source).map((item) => `${item.sourceType}:${item.source}`))];
+    const conflict = (["project", "global"] as const).some((scope) => {
+      const scoped = entries.filter((entry) => entry.installation.scope === scope);
+      const scopedHashes = new Set(scoped.map((entry) => entry.installation.effectiveConfigHash ?? entry.installation.configHash));
+      const scopedUpstreams = new Set(scoped.map((entry) => inferMcpUpstream(entry.server)).filter((item) => item.source).map((item) => `${item.sourceType}:${item.source}`));
+      return scopedHashes.size > 1 || scopedUpstreams.size > 1;
+    });
     const prior = previous.servers[name];
     const unchanged = prior && JSON.stringify(prior.installations) === JSON.stringify(installations);
     const selected = upstreams.length === 1 ? inferred.find((item) => item.source) : undefined;
@@ -820,7 +1057,7 @@ export function scanMcpManifest(
       source: selected?.source ?? null,
       sourceType: selected?.sourceType ?? null,
       configHash: hashes.length === 1 ? hashes[0] : null,
-      conflict: hashes.length > 1 || upstreams.length > 1,
+      conflict,
       installations,
       updatedAt: unchanged ? prior.updatedAt : now,
       provenance: selected?.provenance ?? "scan",
@@ -833,76 +1070,296 @@ export function sameMcpServer(left: McpServer, right: McpServer): boolean {
   return JSON.stringify(semanticMcp(left)) === JSON.stringify(semanticMcp(right));
 }
 
+function effectiveMcpServers(harness: string, servers: Record<string, McpServer>): Record<string, McpServer> {
+  if (harness !== "codex") return servers;
+  const piPath = mcpTargetPath("pi", "global");
+  if (!piPath || !existsSync(piPath)) return servers;
+  let piServers: Record<string, McpServer>;
+  try { piServers = normalizeMcpFile(piPath); } catch { return servers; }
+  return Object.fromEntries(Object.entries(servers).map(([name, server]) => {
+    const reference = piServerReference(server);
+    return [name, reference && piServers[reference] ? piServers[reference] : server];
+  }));
+}
+
 function targetMcpServers(harness: string, scope: "project" | "global"): Record<string, McpServer> {
   const path = mcpTargetPath(harness, scope);
-  return path && existsSync(path) ? normalizeMcpFile(path) : {};
+  return path && existsSync(path) ? effectiveMcpServers(harness, normalizeMcpFile(path)) : {};
+}
+
+const mcpSemanticFields = ["type", "command", "args", "cwd", "env", "url", "headers", "enabled"] as const;
+
+function bindingId(binding: Pick<McpSource, "harness" | "path">): string {
+  return `${binding.harness}:${binding.path}`;
+}
+
+function differingMcpFields(servers: McpServer[]): string[] {
+  const semantic = servers.map((server) => semanticMcp(server) as Record<string, unknown>);
+  return mcpSemanticFields.filter((field) => new Set(semantic.map((server) => JSON.stringify(server[field]))).size > 1);
+}
+
+function mergeMcpVariants(servers: McpServer[]): { server?: McpServer; collisions: string[] } {
+  const merged: McpServer = {};
+  const collisions: string[] = [];
+  const atomic = ["command", "args", "cwd", "url", "type", "enabled"] as const;
+  for (const field of atomic) {
+    const present = servers.map((server) => server[field]).filter((value) => value !== undefined);
+    const unique = [...new Map(present.map((value) => [JSON.stringify(value), value])).values()];
+    if (unique.length > 1) collisions.push(field);
+    else if (unique.length === 1) (merged as any)[field] = unique[0];
+  }
+  if (servers.some((server) => server.url) && servers.some((server) => server.command)) collisions.push("transport");
+  for (const field of ["env"] as const) {
+    const entries: Record<string, string> = {};
+    for (const server of servers) {
+      for (const [key, value] of Object.entries(server[field] ?? {})) {
+        if (key in entries && entries[key] !== value) collisions.push(`${field}.${key}`);
+        else entries[key] = value;
+      }
+    }
+    if (Object.keys(entries).length) merged[field] = entries;
+  }
+  const headers = new Map<string, { key: string; value: string }>();
+  for (const server of servers) {
+    for (const [key, value] of Object.entries(server.headers ?? {})) {
+      const normalized = key.toLowerCase();
+      const existing = headers.get(normalized);
+      if (existing && existing.value !== value) collisions.push(`headers.${normalized}`);
+      else if (!existing) headers.set(normalized, { key, value });
+    }
+  }
+  if (headers.size) merged.headers = Object.fromEntries([...headers.values()].map(({ key, value }) => [key, value]));
+  return { ...(collisions.length ? {} : { server: merged }), collisions: [...new Set(collisions)].sort() };
+}
+
+function rendererFor(harness: string): string {
+  if (["claude", "grok", "gemini"].includes(harness)) return `${harness} native CLI`;
+  if (harness === "catalog") return "harness-sync mcp.json";
+  return `${harness} native config`;
+}
+
+export function mcpNativeCliCommand(
+  harness: "claude" | "grok" | "gemini",
+  scope: "project" | "global",
+  name: string,
+  server: McpServer,
+): string[] {
+  const transport = server.url ? (server.type === "sse" ? "sse" : "http") : "stdio";
+  const envArgs = Object.entries(server.env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
+  const headerArgs = Object.entries(server.headers ?? {}).flatMap(([key, value]) => ["--header", `${key}: ${value}`]);
+  const targetScope = scope === "global" ? "user" : "project";
+  if (harness === "claude" || harness === "grok") {
+    return [harness, "mcp", "add", "--scope", targetScope, "--transport", transport, ...envArgs, ...headerArgs, name, ...(server.url ? [server.url] : ["--", server.command!, ...(server.args ?? [])])];
+  }
+  return ["gemini", "mcp", "add", "--scope", targetScope, "--transport", transport, ...envArgs, ...headerArgs, name, ...(server.url ? [server.url] : [server.command!, ...(server.args ?? [])])];
+}
+
+export function buildMcpSyncPlan(
+  source: McpTargetBinding,
+  targets: McpTargetBinding[],
+  resolutions: Record<string, McpResolution> = {},
+  mode: "interactive" | "non-interactive" = "non-interactive",
+): { plan: McpSyncPlan; definitions: Record<string, McpServer> } {
+  const identical: string[] = [], missing: string[] = [], conflicts: string[] = [], unrelated: string[] = [];
+  const operations: McpSyncPlan["operations"] = [], unresolvedConflicts: McpSyncPlan["unresolvedConflicts"] = [];
+  const skippedConflicts: string[] = [], definitions: Record<string, McpServer> = {};
+  const sourceId = bindingId(source);
+  const sourceNames = new Set(Object.keys(source.servers));
+  for (const target of targets) {
+    for (const name of Object.keys(target.servers)) if (!sourceNames.has(name)) unrelated.push(`${target.harness}:${name}`);
+  }
+
+  for (const [name, sourceServer] of Object.entries(source.servers)) {
+    for (const target of targets) {
+      if (!target.servers[name]) missing.push(`${target.harness}:${name}`);
+      else if (sameMcpServer(sourceServer, target.servers[name])) identical.push(`${target.harness}:${name}`);
+    }
+    const bindings = [
+      { id: sourceId, harness: source.harness, path: source.path, server: sourceServer },
+      ...targets.flatMap((target) => target.servers[name] ? [{ id: bindingId(target), harness: target.harness, path: target.path, server: target.servers[name] }] : []),
+    ];
+    const variants = bindings.filter((binding, index) => bindings.findIndex((candidate) => sameMcpServer(candidate.server, binding.server)) === index);
+    const difference = differingMcpFields(variants.map((variant) => variant.server));
+    const merge = mergeMcpVariants(variants.map((variant) => variant.server));
+    const resolution = resolutions[name];
+    let chosen = sourceServer;
+    let resolutionName: McpSyncPlan["operations"][number]["resolution"] = "source";
+    let definitionSource = sourceId;
+
+    if (variants.length > 1) {
+      conflicts.push(name);
+      if (!resolution || resolution.action === "merge" && !merge.server) {
+        unresolvedConflicts.push({
+          server: name,
+          variants: variants.map(({ id, harness, path }) => ({ id, harness, path })),
+          differingFields: difference,
+          envKeys: [...new Set(variants.flatMap((variant) => Object.keys(variant.server.env ?? {})))].sort(),
+          headerKeys: [...new Set(variants.flatMap((variant) => Object.keys(variant.server.headers ?? {})))].sort(),
+          collisions: merge.collisions,
+        });
+        continue;
+      }
+      if (resolution.action === "skip") {
+        skippedConflicts.push(name);
+        continue;
+      }
+      if (resolution.action === "merge") {
+        chosen = merge.server!;
+        resolutionName = "reviewed-merge";
+        definitionSource = "reviewed-field-sources";
+      } else {
+        const selected = variants.find((variant) => variant.id === resolution.variant);
+        if (!selected) {
+          unresolvedConflicts.push({ server: name, variants: variants.map(({ id, harness, path }) => ({ id, harness, path })), differingFields: difference, envKeys: [], headerKeys: [], collisions: [`unknown variant ${resolution.variant ?? ""}`] });
+          continue;
+        }
+        chosen = selected.server;
+        definitionSource = selected.id;
+        resolutionName = selected.id === sourceId ? "source" : "variant";
+      }
+    }
+
+    const changedTargets = targets.filter((target) => {
+      if (!target.servers[name]) return true;
+      if (sameMcpServer(chosen, target.servers[name])) {
+        return target.managedWrappers?.includes(name) ?? false;
+      }
+      return true;
+    });
+    if (!changedTargets.length) continue;
+    definitions[name] = chosen;
+    operations.push({
+      server: name,
+      resolution: variants.length === 1 ? "identical" : resolutionName,
+      definitionSource,
+      targets: changedTargets.map((target) => ({ binding: bindingId(target), path: target.path, renderer: rendererFor(target.harness) })),
+      differingFields: difference,
+      envKeys: Object.keys(chosen.env ?? {}).sort(),
+      headerKeys: Object.keys(chosen.headers ?? {}).sort(),
+      preserve: ["unrelated servers", "unknown native fields"],
+    });
+  }
+
+  const blocked = unresolvedConflicts.length > 0;
+  const plan: McpSyncPlan = {
+    version: 1,
+    mode,
+    apply: false,
+    status: blocked ? "blocked-by-conflict" : "ready-for-review",
+    inventory: { source: sourceId, identical: [...new Set(identical)].sort(), missing: [...new Set(missing)].sort(), conflicts: [...new Set(conflicts)].sort(), unrelated: [...new Set(unrelated)].sort() },
+    operations,
+    unresolvedConflicts,
+    skippedConflicts,
+    writes: [],
+    requiresSeparateApplyConsent: operations.length > 0,
+    exitCode: blocked ? 2 : 0,
+  };
+  return { plan, definitions };
 }
 
 function mcpSync(args: string[]): void {
   const apply = applyRequired(args);
   const valueAfter = (flag: string, fallback: string) => { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : fallback; };
+  const valuesAfter = (flag: string) => args.flatMap((arg, index) => arg === flag && args[index + 1] ? [args[index + 1]] : []);
   const from = valueAfter("--from", "auto");
-  const scope = valueAfter("--scope", existsSync(join(cwd, ".git")) ? "project" : "auto");
+  const scope = valueAfter("--scope", "auto");
   const source = sourceForMcp(from, scope);
   const effectiveScope = scope === "auto" ? source.scope : scope;
   const requestedServer = valueAfter("--server", "");
-  const allServers = normalizeMcpFile(source.path);
+  const allServers = effectiveMcpServers(source.harness, normalizeMcpFile(source.path));
   const servers = requestedServer ? Object.fromEntries(Object.entries(allServers).filter(([name]) => name === requestedServer)) : allServers;
   if (requestedServer && !Object.keys(servers).length) fail(`MCP server not found in source: ${requestedServer}`);
-  const requestedTarget = valueAfter("--target", "");
-  const supportedTargets = ["codex", "claude", "grok", "opencode", "gemini", "hermes", "goose"];
-  const installed = detectedHarnesses().filter((item) => item.installed && supportedTargets.includes(item.id) && (!requestedTarget || item.id === requestedTarget));
-  if (requestedTarget && !installed.length) fail(`MCP target not installed or unsupported: ${requestedTarget}`);
-  const conflicts: string[] = [], identical: string[] = [], missing: Array<{ harness: string; name: string }> = [];
-  const unsupported = installed.filter((target) => !mcpTargetPath(target.id, effectiveScope)).map((target) => `${target.id}:${effectiveScope}`);
-  for (const target of installed) {
-    if (!mcpTargetPath(target.id, effectiveScope)) continue;
-    const existing = targetMcpServers(target.id, effectiveScope);
-    for (const [name, server] of Object.entries(servers)) {
-      if (!existing[name]) missing.push({ harness: target.id, name });
-      else if (sameMcpServer(server, existing[name])) identical.push(`${target.id}:${name}`);
-      else conflicts.push(`${target.id}:${name}`);
+  const requestedTargets = valuesAfter("--target");
+  const supportedTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
+  const directTargets = new Set(["codex", "pi", "opencode", "hermes", "goose", "catalog"]);
+  const detected = detectedHarnesses();
+  const targetNames = requestedTargets.length
+    ? [...new Set(requestedTargets)]
+    : detected.filter((item) => item.installed && supportedTargets.includes(item.id)).map((item) => item.id);
+  for (const target of targetNames) {
+    if (!supportedTargets.includes(target)) fail(`unsupported MCP target: ${target}`);
+    if (target !== "catalog" && !directTargets.has(target) && !detected.some((item) => item.id === target && item.installed)) fail(`MCP target not installed: ${target}`);
+  }
+  const unsupported = targetNames.filter((target) => !mcpTargetPath(target, effectiveScope)).map((target) => `${target}:${effectiveScope}`);
+  const replaceWrappers = args.includes("--direct");
+  const targets: McpTargetBinding[] = targetNames.flatMap((harness) => {
+    const path = mcpTargetPath(harness, effectiveScope as "project" | "global");
+    if (!path) return [];
+    const raw = existsSync(path) ? normalizeMcpFile(path) : {};
+    const effective = harness === "codex" ? effectiveMcpServers(harness, raw) : raw;
+    const managedWrappers = replaceWrappers && harness === "codex"
+      ? Object.entries(raw).filter(([, server]) => piServerReference(server)).map(([name]) => name)
+      : [];
+    return [{ harness, path, scope: effectiveScope as "project" | "global", servers: effective, managedWrappers }];
+  });
+  const sourceBinding: McpTargetBinding = { ...source, servers };
+  const resolutions: Record<string, McpResolution> = {};
+  for (const raw of valuesAfter("--resolve")) {
+    const separator = raw.indexOf("=");
+    if (separator < 1) fail(`invalid --resolve value: ${raw}`);
+    const name = raw.slice(0, separator), choice = raw.slice(separator + 1);
+    if (choice === "skip" || choice === "merge") resolutions[name] = { action: choice };
+    else if (choice === "source") resolutions[name] = { action: "variant", variant: bindingId(sourceBinding) };
+    else if (choice.startsWith("target:")) {
+      const target = targets.find((item) => item.harness === choice.slice("target:".length));
+      if (!target) fail(`unknown target variant for ${name}: ${choice}`);
+      resolutions[name] = { action: "variant", variant: bindingId(target) };
+    } else fail(`unknown conflict resolution for ${name}: ${choice}`);
+  }
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY && !args.includes("--non-interactive"));
+  let built = buildMcpSyncPlan(sourceBinding, targets, resolutions, interactive ? "interactive" : "non-interactive");
+  if (interactive) {
+    for (const conflict of built.plan.unresolvedConflicts) {
+      console.log(`Conflict ${conflict.server}: fields=${conflict.differingFields.join(", ")}; env keys=${conflict.envKeys.join(", ") || "none"}; header keys=${conflict.headerKeys.join(", ") || "none"}; collisions=${conflict.collisions.join(", ") || "none"}`);
+      conflict.variants.forEach((variant, index) => console.log(`  ${index + 1}) ${variant.id}`));
+      const mergeOption = conflict.collisions.length ? "" : ", m=review safe merge";
+      const answer = globalThis.prompt?.(`Choose 1-${conflict.variants.length}${mergeOption}, s=skip:`)?.trim().toLowerCase();
+      if (answer === "s") resolutions[conflict.server] = { action: "skip" };
+      else if (answer === "m" && !conflict.collisions.length) resolutions[conflict.server] = { action: "merge" };
+      else {
+        const variant = conflict.variants[Number(answer) - 1];
+        if (variant) resolutions[conflict.server] = { action: "variant", variant: variant.id };
+      }
     }
+    built = buildMcpSyncPlan(sourceBinding, targets, resolutions, "interactive");
   }
   console.log(`Source: ${source.harness}:${source.path} (${Object.keys(servers).length} servers); scope=${effectiveScope}`);
-  console.log(`Missing: ${missing.map((item) => `${item.harness}:${item.name}`).join(", ") || "none"}`);
-  console.log(`Identical: ${identical.join(", ") || "none"}`);
-  console.log(`Conflicts: ${conflicts.join(", ") || "none"}`);
+  console.log(`Missing: ${built.plan.inventory.missing.join(", ") || "none"}`);
+  console.log(`Identical: ${built.plan.inventory.identical.join(", ") || "none"}`);
+  console.log(`Conflicts: ${built.plan.inventory.conflicts.join(", ") || "none"}`);
   console.log(`Unsupported scope: ${unsupported.join(", ") || "none"}`);
+  console.log(JSON.stringify({ ...built.plan, apply }, null, 2));
+  if (built.plan.status === "blocked-by-conflict") {
+    process.exitCode = built.plan.exitCode;
+    return;
+  }
   if (!apply) return;
-  if (conflicts.length) fail("existing server names require separate conflict confirmation; resolve or narrow source first");
-  const targetPaths = installed.map((item) => mcpTargetPath(item.id, effectiveScope)).filter((path): path is string => Boolean(path));
-  if (effectiveScope === "project" && hasSecretLiterals(servers)) {
+  if (unsupported.length) fail(`target does not support ${effectiveScope} MCP scope; no config was written: ${unsupported.join(", ")}`);
+  const targetPaths = [...new Set(built.plan.operations.flatMap((operation) => operation.targets.map((target) => target.path)))];
+  if (effectiveScope === "project" && hasSecretLiterals(built.definitions)) {
     const unsafe = targetPaths.filter((path) => !gitIgnored(path));
     if (unsafe.length) fail(`secret-bearing project configs must be gitignored: ${unsafe.join(", ")}`);
   }
   const backupRoot = backup([...targetPaths, mcpManifestPath]);
   try {
-    for (const harness of ["codex", "opencode", "hermes", "goose"]) {
-      const path = mcpTargetPath(harness, effectiveScope);
-      const selected = Object.fromEntries(missing.filter((item) => item.harness === harness).map((item) => [item.name, servers[item.name]]));
+    for (const harness of ["codex", "pi", "opencode", "hermes", "goose", "catalog"]) {
+      const target = targets.find((item) => item.harness === harness);
+      const selected = Object.fromEntries(built.plan.operations.filter((operation) => operation.targets.some((item) => item.binding === (target ? bindingId(target) : ""))).map((operation) => [operation.server, built.definitions[operation.server]]));
+      const path = target?.path;
       if (path && Object.keys(selected).length) renderDirectTarget(harness, path, selected);
     }
-    for (const item of missing) {
-      if (["codex", "opencode", "hermes", "goose"].includes(item.harness)) continue;
-      const server = servers[item.name];
-      const transport = server.url ? (server.type === "sse" ? "sse" : "http") : "stdio";
-      const envArgs = Object.entries(server.env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
-      const headerArgs = Object.entries(server.headers ?? {}).flatMap(([key, value]) => ["--header", `${key}: ${value}`]);
-      if (item.harness === "claude") {
-        const targetScope = effectiveScope === "global" ? "user" : "project";
-        run(["claude", "mcp", "add", "--scope", targetScope, "--transport", transport, ...envArgs, ...headerArgs, item.name, ...(server.url ? [server.url] : ["--", server.command!, ...(server.args ?? [])])]);
-      } else if (item.harness === "grok") {
-        const targetScope = effectiveScope === "project" ? "project" : "user";
-        run(["grok", "mcp", "add", "--scope", targetScope, "--transport", transport, ...envArgs, ...headerArgs, item.name, ...(server.url ? [server.url] : ["--", server.command!, ...(server.args ?? [])])]);
-      } else if (item.harness === "gemini") {
-        const targetScope = effectiveScope === "global" ? "user" : "project";
-        run(["gemini", "mcp", "add", "--scope", targetScope, "--transport", transport, ...envArgs, ...headerArgs, item.name, ...(server.url ? [server.url] : [server.command!, ...(server.args ?? [])])]);
+    for (const operation of built.plan.operations) for (const plannedTarget of operation.targets) {
+      const target = targets.find((item) => bindingId(item) === plannedTarget.binding)!;
+      if (directTargets.has(target.harness)) continue;
+      const server = built.definitions[operation.server];
+      if (["claude", "grok", "gemini"].includes(target.harness)) {
+        run(mcpNativeCliCommand(target.harness as "claude" | "grok" | "gemini", effectiveScope as "project" | "global", operation.server, server));
+        if (existsSync(target.path)) chmodSync(target.path, 0o600);
       }
     }
     writeJsonAtomic(mcpManifestPath, scanMcpManifest(mcpSources(), readMcpManifest()));
     cleanOldBackups();
-    console.log(`Applied ${missing.length} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
+    console.log(`Applied ${built.plan.operations.reduce((count, operation) => count + operation.targets.length, 0)} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
   } catch (error) {
     restoreBackup(backupRoot);
     throw new Error(`MCP sync failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
@@ -916,7 +1373,7 @@ function usage(): void {
 export function main(argv = process.argv.slice(2)): void {
   const [command, ...args] = argv;
   try {
-    if (!command) return usage();
+    if (!command || command === "--help" || command === "-h") return usage();
     if (command === "audit") return audit(args.includes("--json"));
     if (command === "init") return initState(args);
     if (command === "instructions") return syncInstructions(args);
