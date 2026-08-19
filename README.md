@@ -55,15 +55,45 @@ Install it as a global agent skill:
 npx skills add timvdhoorn/harness-sync --skill harness-sync -g
 ```
 
-You can also clone the repository and run the CLI directly:
+## Quick start
+
+The recommended way to use Harness Sync is through an agent. Open the AI coding
+harness where you installed the skill and invoke it with the harness's skill
+picker or command syntax. In harnesses that expose skills as slash commands,
+run:
+
+```text
+/harness-sync
+```
+
+With no additional command, the agent starts with a read-only audit. It explains
+the findings, recommends one next action, and asks one question at a time. When a
+change is needed, the agent shows the exact files, scope, conflicts, and secret
+movement before asking for confirmation. You do not need to construct the CLI
+commands yourself.
+
+You can also give the skill a specific job in plain language:
+
+```text
+Use harness-sync to initialize provenance for my installed skills and MCP servers.
+```
+
+```text
+Use harness-sync to compare my Pi and Codex MCP configurations.
+```
+
+The agent runs the required dry runs, handles conflict choices with you, applies
+only approved changes, and audits the result afterward.
+
+## Direct CLI usage
+
+The CLI is available for scripting, automation, or use without an agent. Clone
+the repository first:
 
 ```bash
 git clone https://github.com/timvdhoorn/harness-sync.git
 cd harness-sync
-bun run scripts/harness-sync.ts audit
 ```
-
-## Quick start
 
 Start with a read-only audit:
 
@@ -108,7 +138,7 @@ bun run scripts/harness-sync.ts mcp \
 
 Run another audit after every apply.
 
-## Commands
+## CLI commands
 
 | Command | Purpose |
 | --- | --- |
