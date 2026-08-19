@@ -1,3 +1,5 @@
+![Harness Sync connects Claude, ChatGPT, Codex, Grok, Pi Agent, OpenCode, Gemini, Goose, and Hermes](assets/harness-sync-hero.png)
+
 # Harness Sync
 
 Keep skills, instruction files, and MCP server definitions consistent across AI
