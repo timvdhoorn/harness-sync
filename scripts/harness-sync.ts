@@ -64,7 +64,7 @@ export type McpInstallation = {
   indirection?: { harness: "pi"; server: string; path: string };
 };
 export type McpAuditIssue = {
-  issue: "non-portable-path" | "harness-coupled-launcher" | "missing-pi-server";
+  issue: "non-portable-path" | "harness-coupled-launcher" | "missing-pi-server" | "app-owned-harness" | "app-owned-platform";
   harness: string;
   path: string;
   server: string;
@@ -85,6 +85,8 @@ export type TrackedMcp = {
 export type McpManifest = { version: 1; servers: Record<string, TrackedMcp> };
 export type McpTargetBinding = McpSource & { servers: Record<string, McpServer>; managedWrappers?: string[] };
 export type McpResolution = { action: "variant" | "merge" | "skip"; variant?: string };
+type AppOwnedMcp = { owner: "codex"; platform: "darwin"; field: "command"; value: string };
+type McpCompatibilityReason = "requires-codex" | "requires-darwin";
 export type McpSyncPlan = {
   version: 1;
   mode: "interactive" | "non-interactive";
@@ -110,6 +112,11 @@ export type McpSyncPlan = {
     collisions: string[];
   }>;
   skippedConflicts: string[];
+  skippedIncompatible: Array<{
+    server: string;
+    binding: string;
+    reasons: McpCompatibilityReason[];
+  }>;
   writes: [];
   requiresSeparateApplyConsent: boolean;
   exitCode: number;
@@ -455,6 +462,35 @@ function harnessCoupledLauncherValues(value: string): string[] {
   return value.match(/(?:\$HOME|~|\/Users\/[^/:\s]+|\/home\/[^/:\s]+)\/\.agents\/(?:codex|claude|pi|grok|opencode|gemini|hermes|goose)\/[A-Za-z0-9._/-]+/g) ?? [];
 }
 
+export function classifyAppOwnedMcp(server: McpServer): AppOwnedMcp | undefined {
+  const command = server.command;
+  if (!command) return undefined;
+  if (/^\/Applications\/(?:ChatGPT|Codex)\.app\/Contents\/Resources\/cua_node\/bin\/node_repl$/.test(command)) {
+    return { owner: "codex", platform: "darwin", field: "command", value: command };
+  }
+  if (
+    server.args?.length === 1
+    && server.args[0] === "mcp"
+    && /(?:^|\/)Codex Computer Use\.app\/Contents\/SharedSupport\/SkyComputerUseClient\.app\/Contents\/MacOS\/SkyComputerUseClient$/.test(command)
+  ) {
+    return { owner: "codex", platform: "darwin", field: "command", value: command };
+  }
+  return undefined;
+}
+
+function appOwnedMcpCompatibility(
+  server: McpServer,
+  harness: string,
+  currentPlatform: NodeJS.Platform,
+): McpCompatibilityReason[] {
+  const ownership = classifyAppOwnedMcp(server);
+  if (!ownership) return [];
+  return [
+    ...(harness === ownership.owner ? [] : ["requires-codex" as const]),
+    ...(currentPlatform === ownership.platform ? [] : ["requires-darwin" as const]),
+  ];
+}
+
 export function inspectMcpConfigurations(
   sources: McpSource[],
   currentPlatform: NodeJS.Platform = platform(),
@@ -490,6 +526,29 @@ export function inspectMcpConfigurations(
 
   for (const item of loaded) {
     for (const [name, server] of Object.entries(item.servers)) {
+      const appOwnership = classifyAppOwnedMcp(server);
+      if (appOwnership && item.source.harness !== appOwnership.owner) {
+        issues.push({
+          issue: "app-owned-harness",
+          harness: item.source.harness,
+          path: item.source.path,
+          server: name,
+          field: appOwnership.field,
+          value: appOwnership.value,
+          indirectHarnesses: [],
+        });
+      }
+      if (appOwnership && currentPlatform !== appOwnership.platform) {
+        issues.push({
+          issue: "app-owned-platform",
+          harness: item.source.harness,
+          path: item.source.path,
+          server: name,
+          field: appOwnership.field,
+          value: appOwnership.value,
+          indirectHarnesses: [],
+        });
+      }
       const fields: Array<[string, string]> = [
         ...(server.command ? [["command", server.command] as [string, string]] : []),
         ...(server.args ?? []).map((value, index) => [`args[${index}]`, value] as [string, string]),
@@ -626,6 +685,10 @@ function audit(asJson: boolean): void {
         console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} references missing Pi server in ${item.targetPath}; indirect harnesses=${item.indirectHarnesses.join(", ")}`);
       } else if (item.issue === "harness-coupled-launcher") {
         console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} depends on a harness-specific launcher`);
+      } else if (item.issue === "app-owned-harness") {
+        console.log(`MCP ownership: ${item.path}: ${item.server} ${item.field}=${item.value} is owned by Codex and cannot be used by ${item.harness}`);
+      } else if (item.issue === "app-owned-platform") {
+        console.log(`MCP ownership: ${item.path}: ${item.server} ${item.field}=${item.value} is macOS-only and cannot be used on ${platform()}`);
       } else {
         console.log(`MCP portability: ${item.path}: ${item.server} ${item.field}=${item.value} is not portable on ${platform()}; indirect harnesses=${item.indirectHarnesses.join(", ") || "none"}`);
       }
@@ -1253,10 +1316,11 @@ export function buildMcpSyncPlan(
   targets: McpTargetBinding[],
   resolutions: Record<string, McpResolution> = {},
   mode: "interactive" | "non-interactive" = "non-interactive",
+  currentPlatform: NodeJS.Platform = platform(),
 ): { plan: McpSyncPlan; definitions: Record<string, McpServer> } {
   const identical: string[] = [], missing: string[] = [], conflicts: string[] = [], unrelated: string[] = [];
   const operations: McpSyncPlan["operations"] = [], unresolvedConflicts: McpSyncPlan["unresolvedConflicts"] = [];
-  const skippedConflicts: string[] = [], definitions: Record<string, McpServer> = {};
+  const skippedConflicts: string[] = [], skippedIncompatible: McpSyncPlan["skippedIncompatible"] = [], definitions: Record<string, McpServer> = {};
   const sourceId = bindingId(source);
   const sourceNames = new Set(Object.keys(source.servers));
   for (const target of targets) {
@@ -1313,7 +1377,13 @@ export function buildMcpSyncPlan(
       }
     }
 
-    const changedTargets = targets.filter((target) => {
+    const compatibleTargets = targets.filter((target) => {
+      const reasons = appOwnedMcpCompatibility(chosen, target.harness, currentPlatform);
+      if (!reasons.length) return true;
+      skippedIncompatible.push({ server: name, binding: bindingId(target), reasons });
+      return false;
+    });
+    const changedTargets = compatibleTargets.filter((target) => {
       if (!target.servers[name]) return true;
       if (sameMcpServer(chosen, target.servers[name])) {
         return target.managedWrappers?.includes(name) ?? false;
@@ -1344,6 +1414,7 @@ export function buildMcpSyncPlan(
     operations,
     unresolvedConflicts,
     skippedConflicts,
+    skippedIncompatible,
     writes: [],
     requiresSeparateApplyConsent: operations.length > 0,
     exitCode: blocked ? 2 : 0,
