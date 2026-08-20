@@ -228,8 +228,20 @@ describe("MCP normalization", () => {
       field: "command",
       value: "/Users/example/.codex/plugins/cache/openai-bundled/computer-use/1.0.750/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
     });
+    expect(classifyAppOwnedMcp({
+      command: "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+      args: ["mcp"],
+    })?.owner).toBe("codex");
     expect(classifyAppOwnedMcp({ command: "npx", args: ["node_repl"] })).toBeUndefined();
     expect(classifyAppOwnedMcp({ command: "computer-use", args: ["mcp"] })).toBeUndefined();
+    expect(classifyAppOwnedMcp({
+      command: "/tmp/fake/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+      args: ["mcp"],
+    })).toBeUndefined();
+    expect(classifyAppOwnedMcp({
+      command: "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+      args: ["mcp", "extra"],
+    })).toBeUndefined();
   });
 
   test("skips app-owned definitions for incompatible sync targets and platforms", () => {
@@ -272,6 +284,42 @@ describe("MCP normalization", () => {
     const built = buildMcpSyncPlan(source, targets, {}, "non-interactive", "linux");
     expect(built.plan.operations.map((operation) => operation.server).sort()).toEqual(["computer-use", "node_repl"]);
     expect(built.plan.skippedIncompatible).toEqual([]);
+  });
+
+  test("does not overwrite an incompatible target-owned definition with a portable conflict resolution", () => {
+    const appCommand = "/Users/example/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+    const source = { harness: "claude", path: "/work/.mcp.json", scope: "global" as const, servers: {
+      "computer-use": { command: "uvx", args: ["computer-use"], env: { TOKEN: "source-secret" } },
+    } };
+    const targets = [{ harness: "grok", path: "/work/.grok/config.toml", scope: "global" as const, servers: {
+      "computer-use": { command: appCommand, args: ["mcp"], env: { TOKEN: "target-secret" } },
+    } }];
+
+    const sourceChosen = buildMcpSyncPlan(source, targets, {
+      "computer-use": { action: "variant", variant: "claude:/work/.mcp.json" },
+    }, "non-interactive", "darwin");
+    expect(sourceChosen.plan.operations).toEqual([]);
+    expect(sourceChosen.definitions["computer-use"]).toBeUndefined();
+    expect(sourceChosen.plan.skippedIncompatible).toEqual([{
+      server: "computer-use",
+      binding: "grok:/work/.grok/config.toml",
+      reasons: ["requires-codex"],
+    }]);
+    expect(JSON.stringify(sourceChosen.plan)).not.toContain("source-secret");
+    expect(JSON.stringify(sourceChosen.plan)).not.toContain("target-secret");
+
+    const targetChosen = buildMcpSyncPlan(source, targets, {
+      "computer-use": { action: "variant", variant: "grok:/work/.grok/config.toml" },
+    }, "non-interactive", "linux");
+    expect(targetChosen.plan.operations).toEqual([]);
+    expect(targetChosen.definitions["computer-use"]).toBeUndefined();
+    expect(targetChosen.plan.skippedIncompatible).toEqual([{
+      server: "computer-use",
+      binding: "grok:/work/.grok/config.toml",
+      reasons: ["requires-codex", "requires-darwin"],
+    }]);
+    expect(JSON.stringify(targetChosen.plan)).not.toContain("source-secret");
+    expect(JSON.stringify(targetChosen.plan)).not.toContain("target-secret");
   });
 
   test("builds a secret-free blocked plan and resolves a chosen variant across selected bindings", () => {

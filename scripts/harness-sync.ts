@@ -462,16 +462,21 @@ function harnessCoupledLauncherValues(value: string): string[] {
   return value.match(/(?:\$HOME|~|\/Users\/[^/:\s]+|\/home\/[^/:\s]+)\/\.agents\/(?:codex|claude|pi|grok|opencode|gemini|hermes|goose)\/[A-Za-z0-9._/-]+/g) ?? [];
 }
 
+const computerUseLauncher = "Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+const userCodexComputerUseLauncher = /^\/Users\/[^/]+\/\.codex\/(?:(?!\.{1,2}\/)[^/]+\/)*Codex Computer Use\.app\/Contents\/SharedSupport\/SkyComputerUseClient\.app\/Contents\/MacOS\/SkyComputerUseClient$/;
+
 export function classifyAppOwnedMcp(server: McpServer): AppOwnedMcp | undefined {
   const command = server.command;
   if (!command) return undefined;
   if (/^\/Applications\/(?:ChatGPT|Codex)\.app\/Contents\/Resources\/cua_node\/bin\/node_repl$/.test(command)) {
     return { owner: "codex", platform: "darwin", field: "command", value: command };
   }
+  const relativeComputerUse = command === `./${computerUseLauncher}`;
+  const userCodexComputerUse = userCodexComputerUseLauncher.test(command);
   if (
     server.args?.length === 1
     && server.args[0] === "mcp"
-    && /(?:^|\/)Codex Computer Use\.app\/Contents\/SharedSupport\/SkyComputerUseClient\.app\/Contents\/MacOS\/SkyComputerUseClient$/.test(command)
+    && (relativeComputerUse || userCodexComputerUse)
   ) {
     return { owner: "codex", platform: "darwin", field: "command", value: command };
   }
@@ -1378,7 +1383,10 @@ export function buildMcpSyncPlan(
     }
 
     const compatibleTargets = targets.filter((target) => {
-      const reasons = appOwnedMcpCompatibility(chosen, target.harness, currentPlatform);
+      const reasons = [...new Set([
+        ...appOwnedMcpCompatibility(chosen, target.harness, currentPlatform),
+        ...appOwnedMcpCompatibility(target.servers[name] ?? {}, target.harness, currentPlatform),
+      ])];
       if (!reasons.length) return true;
       skippedIncompatible.push({ server: name, binding: bindingId(target), reasons });
       return false;
