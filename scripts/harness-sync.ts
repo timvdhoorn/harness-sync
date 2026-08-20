@@ -86,7 +86,7 @@ export type McpManifest = { version: 1; servers: Record<string, TrackedMcp> };
 export type McpTargetBinding = McpSource & { servers: Record<string, McpServer>; managedWrappers?: string[] };
 export type McpResolution = { action: "variant" | "merge" | "skip"; variant?: string };
 type AppOwnedMcp = { owner: "codex"; platform: "darwin"; field: "command"; value: string };
-type McpCompatibilityReason = "requires-codex" | "requires-darwin";
+type McpCompatibilityReason = "requires-codex" | "requires-darwin" | "preserve-app-owned";
 export type McpSyncPlan = {
   version: 1;
   mode: "interactive" | "non-interactive";
@@ -1383,9 +1383,14 @@ export function buildMcpSyncPlan(
     }
 
     const compatibleTargets = targets.filter((target) => {
+      const targetServer = target.servers[name];
+      const preserveTarget = targetServer
+        && classifyAppOwnedMcp(targetServer)
+        && !sameMcpServer(chosen, targetServer);
       const reasons = [...new Set([
         ...appOwnedMcpCompatibility(chosen, target.harness, currentPlatform),
-        ...appOwnedMcpCompatibility(target.servers[name] ?? {}, target.harness, currentPlatform),
+        ...appOwnedMcpCompatibility(targetServer ?? {}, target.harness, currentPlatform),
+        ...(preserveTarget ? ["preserve-app-owned" as const] : []),
       ])];
       if (!reasons.length) return true;
       skippedIncompatible.push({ server: name, binding: bindingId(target), reasons });

@@ -303,7 +303,7 @@ describe("MCP normalization", () => {
     expect(sourceChosen.plan.skippedIncompatible).toEqual([{
       server: "computer-use",
       binding: "grok:/work/.grok/config.toml",
-      reasons: ["requires-codex"],
+      reasons: ["requires-codex", "preserve-app-owned"],
     }]);
     expect(JSON.stringify(sourceChosen.plan)).not.toContain("source-secret");
     expect(JSON.stringify(sourceChosen.plan)).not.toContain("target-secret");
@@ -320,6 +320,36 @@ describe("MCP normalization", () => {
     }]);
     expect(JSON.stringify(targetChosen.plan)).not.toContain("source-secret");
     expect(JSON.stringify(targetChosen.plan)).not.toContain("target-secret");
+  });
+
+  test("preserves a compatible Codex macOS app-owned target across conflict resolutions", () => {
+    const appCommand = "/Users/example/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+    const source = { harness: "claude", path: "/work/.mcp.json", scope: "global" as const, servers: {
+      "computer-use": { command: "uvx", args: ["computer-use"], env: { TOKEN: "source-secret" } },
+    } };
+    const targets = [{ harness: "codex", path: "/Users/example/.codex/config.toml", scope: "global" as const, servers: {
+      "computer-use": { command: appCommand, args: ["mcp"], env: { TOKEN: "target-secret" } },
+    } }];
+
+    const sourceChosen = buildMcpSyncPlan(source, targets, {
+      "computer-use": { action: "variant", variant: "claude:/work/.mcp.json" },
+    }, "non-interactive", "darwin");
+    expect(sourceChosen.plan.operations).toEqual([]);
+    expect(sourceChosen.definitions["computer-use"]).toBeUndefined();
+    expect(sourceChosen.plan.skippedIncompatible).toEqual([{
+      server: "computer-use",
+      binding: "codex:/Users/example/.codex/config.toml",
+      reasons: ["preserve-app-owned"],
+    }]);
+    expect(JSON.stringify(sourceChosen.plan)).not.toContain("source-secret");
+    expect(JSON.stringify(sourceChosen.plan)).not.toContain("target-secret");
+
+    const targetChosen = buildMcpSyncPlan(source, targets, {
+      "computer-use": { action: "variant", variant: "codex:/Users/example/.codex/config.toml" },
+    }, "non-interactive", "darwin");
+    expect(targetChosen.plan.operations).toEqual([]);
+    expect(targetChosen.definitions["computer-use"]).toBeUndefined();
+    expect(targetChosen.plan.skippedIncompatible).toEqual([]);
   });
 
   test("builds a secret-free blocked plan and resolves a chosen variant across selected bindings", () => {
