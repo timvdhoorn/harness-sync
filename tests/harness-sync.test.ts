@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildMcpRemovalPlan, buildMcpSyncPlan, discoverMarketplaceSkills, harnesses, inferMcpScope, inferMcpUpstream, inspectInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, sourceForMcp, validSkillName } from "../scripts/harness-sync";
+import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, harnesses, inferMcpScope, inferMcpUpstream, inspectInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, sourceForMcp, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -212,6 +212,144 @@ describe("MCP normalization", () => {
     expect(sameMcpServer({ command: "npx", args: ["demo"], env: { B: "2", A: "1" } }, { type: "stdio", command: "npx", args: ["demo"], env: { A: "1", B: "2" }, enabled: true })).toBeTrue();
     expect(sameMcpServer({ url: "https://example.test", headers: { Authorization: "x" } }, { type: "http", url: "https://example.test", headers: { authorization: "x" } })).toBeTrue();
     expect(sameMcpServer({ command: "npx", args: ["one"] }, { command: "npx", args: ["two"] })).toBeFalse();
+  });
+
+  test("classifies exact ChatGPT node_repl and Codex Computer Use launchers without using server names", () => {
+    expect(classifyAppOwnedMcp({
+      command: "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+      env: { TOKEN: "secret" },
+    })).toEqual({ owner: "codex", platform: "darwin", field: "command", value: "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl" });
+    expect(classifyAppOwnedMcp({
+      command: "/Users/example/.codex/plugins/cache/openai-bundled/computer-use/1.0.750/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+      args: ["mcp"],
+    })).toEqual({
+      owner: "codex",
+      platform: "darwin",
+      field: "command",
+      value: "/Users/example/.codex/plugins/cache/openai-bundled/computer-use/1.0.750/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+    });
+    expect(classifyAppOwnedMcp({
+      command: "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+      args: ["mcp"],
+    })?.owner).toBe("codex");
+    expect(classifyAppOwnedMcp({ command: "npx", args: ["node_repl"] })).toBeUndefined();
+    expect(classifyAppOwnedMcp({ command: "computer-use", args: ["mcp"] })).toBeUndefined();
+    expect(classifyAppOwnedMcp({
+      command: "/tmp/fake/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+      args: ["mcp"],
+    })).toBeUndefined();
+    expect(classifyAppOwnedMcp({
+      command: "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+      args: ["mcp", "extra"],
+    })).toBeUndefined();
+  });
+
+  test("skips app-owned definitions for incompatible sync targets and platforms", () => {
+    const source = { harness: "catalog", path: "/work/mcp.json", scope: "global" as const, servers: {
+      node_repl: {
+        command: "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+        env: { TOKEN: "source-secret" },
+      },
+    } };
+    const targets = [
+      { harness: "codex", path: "/work/.codex/config.toml", scope: "global" as const, servers: {} },
+      { harness: "grok", path: "/work/.grok/config.toml", scope: "global" as const, servers: {} },
+    ];
+    const darwin = buildMcpSyncPlan(source, targets, {}, "non-interactive", "darwin");
+    expect(darwin.plan.operations[0].targets.map((target) => target.binding)).toEqual(["codex:/work/.codex/config.toml"]);
+    expect(darwin.plan.skippedIncompatible).toEqual([{
+      server: "node_repl",
+      binding: "grok:/work/.grok/config.toml",
+      reasons: ["requires-codex"],
+    }]);
+    expect(darwin.definitions.node_repl.command).toContain("/Applications/ChatGPT.app/");
+    expect(JSON.stringify(darwin.plan)).not.toContain("source-secret");
+
+    const linux = buildMcpSyncPlan(source, targets, {}, "non-interactive", "linux");
+    expect(linux.plan.operations).toEqual([]);
+    expect(linux.definitions.node_repl).toBeUndefined();
+    expect(linux.plan.skippedIncompatible).toEqual([
+      { server: "node_repl", binding: "codex:/work/.codex/config.toml", reasons: ["requires-darwin"] },
+      { server: "node_repl", binding: "grok:/work/.grok/config.toml", reasons: ["requires-codex", "requires-darwin"] },
+    ]);
+    expect(JSON.stringify(linux.plan)).not.toContain("source-secret");
+  });
+
+  test("keeps ordinary same-name MCP definitions portable", () => {
+    const source = { harness: "claude", path: "/work/.mcp.json", scope: "project" as const, servers: {
+      node_repl: { command: "npx", args: ["node_repl"] },
+      "computer-use": { command: "uvx", args: ["computer-use"] },
+    } };
+    const targets = [{ harness: "grok", path: "/work/.grok/config.toml", scope: "project" as const, servers: {} }];
+    const built = buildMcpSyncPlan(source, targets, {}, "non-interactive", "linux");
+    expect(built.plan.operations.map((operation) => operation.server).sort()).toEqual(["computer-use", "node_repl"]);
+    expect(built.plan.skippedIncompatible).toEqual([]);
+  });
+
+  test("does not overwrite an incompatible target-owned definition with a portable conflict resolution", () => {
+    const appCommand = "/Users/example/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+    const source = { harness: "claude", path: "/work/.mcp.json", scope: "global" as const, servers: {
+      "computer-use": { command: "uvx", args: ["computer-use"], env: { TOKEN: "source-secret" } },
+    } };
+    const targets = [{ harness: "grok", path: "/work/.grok/config.toml", scope: "global" as const, servers: {
+      "computer-use": { command: appCommand, args: ["mcp"], env: { TOKEN: "target-secret" } },
+    } }];
+
+    const sourceChosen = buildMcpSyncPlan(source, targets, {
+      "computer-use": { action: "variant", variant: "claude:/work/.mcp.json" },
+    }, "non-interactive", "darwin");
+    expect(sourceChosen.plan.operations).toEqual([]);
+    expect(sourceChosen.definitions["computer-use"]).toBeUndefined();
+    expect(sourceChosen.plan.skippedIncompatible).toEqual([{
+      server: "computer-use",
+      binding: "grok:/work/.grok/config.toml",
+      reasons: ["requires-codex", "preserve-app-owned"],
+    }]);
+    expect(JSON.stringify(sourceChosen.plan)).not.toContain("source-secret");
+    expect(JSON.stringify(sourceChosen.plan)).not.toContain("target-secret");
+
+    const targetChosen = buildMcpSyncPlan(source, targets, {
+      "computer-use": { action: "variant", variant: "grok:/work/.grok/config.toml" },
+    }, "non-interactive", "linux");
+    expect(targetChosen.plan.operations).toEqual([]);
+    expect(targetChosen.definitions["computer-use"]).toBeUndefined();
+    expect(targetChosen.plan.skippedIncompatible).toEqual([{
+      server: "computer-use",
+      binding: "grok:/work/.grok/config.toml",
+      reasons: ["requires-codex", "requires-darwin"],
+    }]);
+    expect(JSON.stringify(targetChosen.plan)).not.toContain("source-secret");
+    expect(JSON.stringify(targetChosen.plan)).not.toContain("target-secret");
+  });
+
+  test("preserves a compatible Codex macOS app-owned target across conflict resolutions", () => {
+    const appCommand = "/Users/example/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+    const source = { harness: "claude", path: "/work/.mcp.json", scope: "global" as const, servers: {
+      "computer-use": { command: "uvx", args: ["computer-use"], env: { TOKEN: "source-secret" } },
+    } };
+    const targets = [{ harness: "codex", path: "/Users/example/.codex/config.toml", scope: "global" as const, servers: {
+      "computer-use": { command: appCommand, args: ["mcp"], env: { TOKEN: "target-secret" } },
+    } }];
+
+    const sourceChosen = buildMcpSyncPlan(source, targets, {
+      "computer-use": { action: "variant", variant: "claude:/work/.mcp.json" },
+    }, "non-interactive", "darwin");
+    expect(sourceChosen.plan.operations).toEqual([]);
+    expect(sourceChosen.definitions["computer-use"]).toBeUndefined();
+    expect(sourceChosen.plan.skippedIncompatible).toEqual([{
+      server: "computer-use",
+      binding: "codex:/Users/example/.codex/config.toml",
+      reasons: ["preserve-app-owned"],
+    }]);
+    expect(JSON.stringify(sourceChosen.plan)).not.toContain("source-secret");
+    expect(JSON.stringify(sourceChosen.plan)).not.toContain("target-secret");
+
+    const targetChosen = buildMcpSyncPlan(source, targets, {
+      "computer-use": { action: "variant", variant: "codex:/Users/example/.codex/config.toml" },
+    }, "non-interactive", "darwin");
+    expect(targetChosen.plan.operations).toEqual([]);
+    expect(targetChosen.definitions["computer-use"]).toBeUndefined();
+    expect(targetChosen.plan.skippedIncompatible).toEqual([]);
   });
 
   test("builds a secret-free blocked plan and resolves a chosen variant across selected bindings", () => {
@@ -787,6 +925,39 @@ describe("MCP provenance", () => {
       indirectHarnesses: ["codex:missing"],
       targetPath: pi,
     });
+  });
+
+  test("reports secret-free ownership and platform issues for app-owned launchers", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const grok = join(root, "grok.toml");
+    const codex = join(root, "codex.toml");
+    const computerUse = "/Users/example/.codex/plugins/cache/openai-bundled/computer-use/1.0.750/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+    writeFileSync(grok, '[mcp_servers.node_repl]\ncommand = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"\n[mcp_servers.node_repl.env]\nTOKEN = "audit-secret"\n');
+    writeFileSync(codex, `[mcp_servers."computer-use"]\ncommand = "${computerUse}"\nargs = ["mcp"]\n`);
+    const issues = inspectMcpConfigurations([
+      { harness: "grok", path: grok, scope: "global" },
+      { harness: "codex", path: codex, scope: "global" },
+    ], "linux");
+    expect(issues).toContainEqual({
+      issue: "app-owned-harness",
+      harness: "grok",
+      path: grok,
+      server: "node_repl",
+      field: "command",
+      value: "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+      indirectHarnesses: [],
+    });
+    expect(issues).toContainEqual({
+      issue: "app-owned-platform",
+      harness: "codex",
+      path: codex,
+      server: "computer-use",
+      field: "command",
+      value: computerUse,
+      indirectHarnesses: [],
+    });
+    expect(JSON.stringify(issues)).not.toContain("audit-secret");
   });
 
   test("audit output and provenance never include MCP secret values", () => {
