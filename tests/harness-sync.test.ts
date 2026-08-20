@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildMcpSyncPlan, discoverMarketplaceSkills, harnesses, inferMcpScope, inferMcpUpstream, inspectInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, sourceForMcp, validSkillName } from "../scripts/harness-sync";
+import { buildMcpRemovalPlan, buildMcpSyncPlan, discoverMarketplaceSkills, harnesses, inferMcpScope, inferMcpUpstream, inspectInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, sourceForMcp, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -376,6 +376,40 @@ describe("MCP normalization", () => {
     }
   });
 
+  test("removes selected servers from every direct native format while preserving unrelated content", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const fixtures = [
+      ["codex", "config.toml", 'theme = "keep"\n\n[mcp_servers.demo]\ncommand = "remove"\n\n[mcp_servers.demo.env]\nTOKEN = "secret"\n\n[mcp_servers.other]\ncommand = "keep"\n'],
+      ["catalog", "catalog.json", JSON.stringify({ topKeep: true, mcpServers: { demo: { command: "remove" }, other: { command: "keep" } } })],
+      ["pi", "pi.json", JSON.stringify({ topKeep: true, mcpServers: { demo: { command: "remove" }, other: { command: "keep" } } })],
+      ["opencode", "opencode.json", JSON.stringify({ topKeep: true, mcp: { demo: { type: "local", command: ["remove"] }, other: { type: "local", command: ["keep"] } } })],
+      ["opencode", "opencode-v2.json", JSON.stringify({ topKeep: true, mcp: { servers: { demo: { type: "local", command: ["remove"] }, other: { type: "local", command: ["keep"] } } } })],
+      ["hermes", "hermes.yaml", "topKeep: true\nmcp_servers:\n  demo:\n    command: remove\n  other:\n    command: keep\n"],
+      ["goose", "goose.yaml", "topKeep: true\nextensions:\n  demo:\n    type: stdio\n    cmd: remove\n  other:\n    type: stdio\n    cmd: keep\n"],
+    ] as const;
+    for (const [harness, filename, initial] of fixtures) {
+      const path = join(root, filename);
+      writeFileSync(path, initial);
+      removeDirectMcpServers(harness, path, ["demo"]);
+      expect(normalizeMcpFile(path).demo).toBeUndefined();
+      expect(normalizeMcpFile(path).other?.command).toBe("keep");
+      expect(readFileSync(path, "utf8")).toContain("topKeep".replace("topKeep", harness === "codex" ? "theme" : "topKeep"));
+    }
+  });
+
+  test("builds a secret-free removal plan with exact targets and missing names", () => {
+    const targets = [
+      { harness: "codex", path: "/home/.codex/config.toml", scope: "global" as const, servers: { demo: { command: "npx", env: { TOKEN: "secret" } } } },
+      { harness: "pi", path: "/home/.pi/mcp/mcp.json", scope: "global" as const, servers: { demo: { command: "npx" }, other: { command: "keep" } } },
+    ];
+    const plan = buildMcpRemovalPlan(["demo", "missing"], targets, "global");
+    expect(plan.operations[0].targets.map((target) => target.binding)).toEqual(["codex:/home/.codex/config.toml", "pi:/home/.pi/mcp/mcp.json"]);
+    expect(plan.missing).toEqual(["codex:/home/.codex/config.toml:missing", "pi:/home/.pi/mcp/mcp.json:missing"]);
+    expect(plan.requiresSeparateApplyConsent).toBeTrue();
+    expect(JSON.stringify(plan)).not.toContain("secret");
+  });
+
   test("builds native Claude, Grok, and Gemini commands with scope and secret movement intact", () => {
     const server = { command: "npx", args: ["demo"], env: { TOKEN: "env-secret" }, headers: { Authorization: "header-secret" } };
     for (const harness of ["claude", "grok", "gemini"] as const) {
@@ -389,6 +423,48 @@ describe("MCP normalization", () => {
       expect(project).toContain("demo");
       expect(project).toContain("npx");
     }
+  });
+
+  test("builds native removal commands with explicit scope", () => {
+    for (const harness of ["claude", "grok", "gemini"] as const) {
+      expect(mcpNativeCliRemoveCommand(harness, "global", "demo")).toEqual([harness, "mcp", "remove", "--scope", "user", "demo"]);
+      expect(mcpNativeCliRemoveCommand(harness, "project", "demo")).toEqual([harness, "mcp", "remove", "--scope", "project", "demo"]);
+    }
+  });
+
+  test("mcp-remove dry-runs before applying selected direct targets", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const project = join(root, "project");
+    const codex = join(root, ".codex", "config.toml");
+    const pi = join(root, ".pi", "mcp", "mcp.json");
+    mkdirSync(project, { recursive: true });
+    mkdirSync(join(root, ".codex"), { recursive: true });
+    mkdirSync(join(root, ".pi", "mcp"), { recursive: true });
+    writeFileSync(codex, '[mcp_servers.demo]\ncommand = "remove"\n\n[mcp_servers.other]\ncommand = "keep"\n');
+    writeFileSync(pi, JSON.stringify({ mcpServers: { demo: { command: "remove" }, other: { command: "keep" } } }));
+    const run = (extra: string[]) => Bun.spawnSync([
+      "bun", "run", join(import.meta.dir, "..", "scripts", "harness-sync.ts"), "mcp-remove",
+      "--scope", "global", "--target", "codex", "--target", "pi", "--server", "demo", ...extra,
+    ], {
+      cwd: project,
+      env: { ...process.env, HOME: root, XDG_STATE_HOME: join(root, "state") },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const beforeCodex = readFileSync(codex, "utf8");
+    const dry = run([]);
+    expect(dry.exitCode).toBe(0);
+    expect(dry.stdout.toString()).toContain('"apply": false');
+    expect(dry.stdout.toString()).toContain('"writes": []');
+    expect(readFileSync(codex, "utf8")).toBe(beforeCodex);
+    const applied = run(["--apply", "--confirmed"]);
+    expect(applied.exitCode).toBe(0);
+    expect(applied.stdout.toString()).toContain("Removed 2 MCP binding(s)");
+    expect(normalizeMcpFile(codex).demo).toBeUndefined();
+    expect(normalizeMcpFile(pi).demo).toBeUndefined();
+    expect(normalizeMcpFile(codex).other?.command).toBe("keep");
+    expect(normalizeMcpFile(pi).other?.command).toBe("keep");
   });
 
   test("renders remote headers idempotently in every direct native format", () => {
@@ -757,7 +833,7 @@ describe("CLI", () => {
       stderr: "pipe",
     });
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.toString()).toContain("harness-sync [audit|init|instructions|add|remove|update|mcp]");
+    expect(result.stdout.toString()).toContain("harness-sync [audit|init|instructions|add|remove|update|mcp|mcp-remove]");
     expect(result.stderr.toString()).toBe("");
   });
 });

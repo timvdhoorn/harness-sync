@@ -34,6 +34,7 @@ Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands
 - `remove <skill>` — remove any found skill from canonical storage and every detected harness.
 - `update [skill ...]` — plan or reinstall tracked global skills from their recorded source; unknown sources are skipped unless explicitly requested.
 - `mcp [--from auto|catalog|codex|claude|pi|grok|opencode|gemini|hermes|goose|<path>] [--target <harness>]... [--scope auto|project|global] [--resolve <server>=source|target:<harness>|merge|skip]` — build a secret-free MCP plan and render reviewed definitions in selected native targets. Add `--direct` only when a proven-equal Codex Pi wrapper should be replaced by the direct definition.
+- `mcp-remove --server <name>... --target <harness>... --scope project|global` — build a secret-free removal plan for exact server bindings. Apply only the reviewed plan with `--apply --confirmed`.
 
 Read [references/behavior.md](references/behavior.md) only when resolving source, MCP, platform, ownership, or recovery details.
 

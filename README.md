@@ -151,6 +151,7 @@ Run another audit after every apply.
 | `remove` | Remove one named skill from canonical storage and detected harnesses. |
 | `update` | Reinstall tracked skills from their recorded sources. |
 | `mcp` | Compare MCP definitions and prepare selected synchronization operations. |
+| `mcp-remove` | Prepare removal of named MCP servers from exact harnesses and scope. |
 
 Show the built-in summary with:
 
@@ -213,6 +214,21 @@ bun run scripts/harness-sync.ts mcp \
   --server filesystem \
   --scope global
 ```
+
+Remove one or more MCP servers only after reviewing the exact bindings:
+
+```bash
+bun run scripts/harness-sync.ts mcp-remove \
+  --scope global \
+  --target codex \
+  --target opencode \
+  --server chrome-devtools \
+  --server cloudflare-docs
+```
+
+The dry run reports every affected path and missing binding. Re-run the same
+command with `--apply --confirmed` after approval. A backup is created before
+any native config or provenance file changes.
 
 A same-name semantic difference is a conflict. Resolve each conflict explicitly:
 

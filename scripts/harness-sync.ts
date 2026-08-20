@@ -114,6 +114,23 @@ export type McpSyncPlan = {
   requiresSeparateApplyConsent: boolean;
   exitCode: number;
 };
+export type McpRemovalPlan = {
+  version: 1;
+  action: "remove";
+  apply: boolean;
+  status: "ready-for-review";
+  scope: "project" | "global";
+  servers: string[];
+  operations: Array<{
+    server: string;
+    targets: Array<{ binding: string; path: string; renderer: string }>;
+    preserve: string[];
+  }>;
+  missing: string[];
+  writes: [];
+  requiresSeparateApplyConsent: boolean;
+  exitCode: 0;
+};
 
 const home = homedir();
 const stateRoot = process.env.XDG_STATE_HOME
@@ -832,7 +849,7 @@ function mcpTargetPath(harness: string, scope: "project" | "global"): string | u
 }
 
 function codexSection(header: string): { server: string; field?: string } | undefined {
-  const match = header.match(/^mcp_servers\.(?:"((?:\\.|[^"])*)"|'([^']*)'|([A-Za-z0-9_-]+))(?:\.(env|http_headers))?$/);
+  const match = header.match(/^mcp_servers\.(?:"((?:\\.|[^"])*)"|'([^']*)'|([A-Za-z0-9_-]+))(?:\.(.+))?$/);
   if (!match) return undefined;
   const server = match[1] !== undefined ? JSON.parse(`"${match[1]}"`) : match[2] ?? match[3];
   return { server, ...(match[4] ? { field: match[4] } : {}) };
@@ -883,6 +900,17 @@ function renderCodex(path: string, servers: Record<string, McpServer>): void {
   let text = existsSync(path) ? readFileSync(path, "utf8") : "";
   for (const [name, server] of Object.entries(servers)) text = updateCodexServer(text, name, server);
   writeTextAtomic(path, text);
+}
+
+function removeCodexServers(path: string, names: Set<string>): void {
+  const text = readFileSync(path, "utf8");
+  const sections = text.trimEnd().split(/(?=^\s*\[[^\]]+\]\s*$)/m);
+  const kept = sections.filter((section) => {
+    const header = section.trim().split("\n")[0]?.trim().match(/^\[([^\]]+)\]$/)?.[1];
+    const parsed = header ? codexSection(header) : undefined;
+    return !parsed || !names.has(parsed.server);
+  });
+  writeTextAtomic(path, `${kept.map((section) => section.trim()).filter(Boolean).join("\n\n")}\n`);
 }
 
 function preserveUnknown(existing: unknown, known: string[]): Record<string, unknown> {
@@ -942,6 +970,37 @@ export function renderDirectTarget(harness: string, path: string, servers: Recor
   if (harness === "pi" || harness === "catalog") return renderPi(path, servers);
   if (harness === "opencode") return renderOpenCode(path, servers);
   if (harness === "hermes" || harness === "goose") return renderYamlTarget(path, harness, servers);
+  fail(`no direct MCP renderer for ${harness}`);
+}
+
+export function removeDirectMcpServers(harness: string, path: string, serverNames: string[]): void {
+  if (!existsSync(path)) return;
+  const names = new Set(serverNames);
+  if (harness === "codex") return removeCodexServers(path, names);
+  if (harness === "pi" || harness === "catalog") {
+    const json: any = readJson(path);
+    const target = json.mcpServers && typeof json.mcpServers === "object"
+      ? json.mcpServers
+      : json.mcp?.servers && typeof json.mcp.servers === "object"
+        ? json.mcp.servers
+        : json.mcp && typeof json.mcp === "object"
+          ? json.mcp
+          : undefined;
+    if (target) for (const name of names) delete target[name];
+    return writeJsonAtomic(path, json);
+  }
+  if (harness === "opencode") {
+    const json: any = path.endsWith(".jsonc") ? Bun.JSONC.parse(readFileSync(path, "utf8")) : readJson(path);
+    const target = json.mcp?.servers && typeof json.mcp.servers === "object" ? json.mcp.servers : json.mcp;
+    if (target && typeof target === "object") for (const name of names) delete target[name];
+    return writeJsonAtomic(path, json);
+  }
+  if (harness === "hermes" || harness === "goose") {
+    const yaml: any = Bun.YAML.parse(readFileSync(path, "utf8"));
+    const target = harness === "hermes" ? yaml.mcp_servers : yaml.extensions;
+    if (target && typeof target === "object") for (const name of names) delete target[name];
+    return writeTextAtomic(path, Bun.YAML.stringify(yaml));
+  }
   fail(`no direct MCP renderer for ${harness}`);
 }
 
@@ -1152,6 +1211,41 @@ export function mcpNativeCliCommand(
     return [harness, "mcp", "add", "--scope", targetScope, "--transport", transport, ...envArgs, ...headerArgs, name, ...(server.url ? [server.url] : ["--", server.command!, ...(server.args ?? [])])];
   }
   return ["gemini", "mcp", "add", "--scope", targetScope, "--transport", transport, ...envArgs, ...headerArgs, name, ...(server.url ? [server.url] : [server.command!, ...(server.args ?? [])])];
+}
+
+export function mcpNativeCliRemoveCommand(
+  harness: "claude" | "grok" | "gemini",
+  scope: "project" | "global",
+  name: string,
+): string[] {
+  return [harness, "mcp", "remove", "--scope", scope === "global" ? "user" : "project", name];
+}
+
+export function buildMcpRemovalPlan(
+  serverNames: string[],
+  targets: McpTargetBinding[],
+  scope: "project" | "global",
+): McpRemovalPlan {
+  const operations = serverNames.map((server) => ({
+    server,
+    targets: targets
+      .filter((target) => Boolean(target.servers[server]))
+      .map((target) => ({ binding: bindingId(target), path: target.path, renderer: rendererFor(target.harness) })),
+    preserve: ["unrelated servers", "unknown native fields"],
+  })).filter((operation) => operation.targets.length > 0);
+  return {
+    version: 1,
+    action: "remove",
+    apply: false,
+    status: "ready-for-review",
+    scope,
+    servers: serverNames,
+    operations,
+    missing: serverNames.flatMap((name) => targets.filter((target) => !target.servers[name]).map((target) => `${bindingId(target)}:${name}`)),
+    writes: [],
+    requiresSeparateApplyConsent: operations.length > 0,
+    exitCode: 0,
+  };
 }
 
 export function buildMcpSyncPlan(
@@ -1366,8 +1460,66 @@ function mcpSync(args: string[]): void {
   }
 }
 
+function mcpRemove(args: string[]): void {
+  const apply = applyRequired(args);
+  const valuesAfter = (flag: string) => args.flatMap((arg, index) => arg === flag && args[index + 1] ? [args[index + 1]] : []);
+  const scopeIndex = args.indexOf("--scope");
+  const scope = scopeIndex >= 0 ? args[scopeIndex + 1] : "";
+  if (scope !== "project" && scope !== "global") fail("mcp-remove requires --scope project|global");
+  const serverNames = [...new Set(valuesAfter("--server"))];
+  if (!serverNames.length) fail("mcp-remove requires at least one --server <name>");
+  if (serverNames.some((name) => name.startsWith("-") || /[\0\r\n]/.test(name))) fail("invalid MCP server name");
+
+  const requestedTargets = valuesAfter("--target");
+  const supportedTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
+  const directTargets = new Set(["codex", "pi", "opencode", "hermes", "goose", "catalog"]);
+  const detected = detectedHarnesses();
+  const targetNames = requestedTargets.length
+    ? [...new Set(requestedTargets)]
+    : detected.filter((item) => item.installed && supportedTargets.includes(item.id)).map((item) => item.id);
+  for (const target of targetNames) {
+    if (!supportedTargets.includes(target)) fail(`unsupported MCP target: ${target}`);
+    if (target !== "catalog" && !directTargets.has(target) && !detected.some((item) => item.id === target && item.installed)) fail(`MCP target not installed: ${target}`);
+  }
+  const unsupported = targetNames.filter((target) => !mcpTargetPath(target, scope)).map((target) => `${target}:${scope}`);
+  const targets: McpTargetBinding[] = targetNames.flatMap((harness) => {
+    const path = mcpTargetPath(harness, scope);
+    if (!path) return [];
+    return [{ harness, path, scope, servers: existsSync(path) ? normalizeMcpFile(path) : {} }];
+  });
+  const plan = buildMcpRemovalPlan(serverNames, targets, scope);
+  console.log(`Remove: ${serverNames.join(", ")}; scope=${scope}`);
+  console.log(`Missing: ${plan.missing.join(", ") || "none"}`);
+  console.log(`Unsupported scope: ${unsupported.join(", ") || "none"}`);
+  console.log(JSON.stringify({ ...plan, apply }, null, 2));
+  if (!apply) return;
+  if (unsupported.length) fail(`target does not support ${scope} MCP scope; no config was written: ${unsupported.join(", ")}`);
+  if (!plan.operations.length) return;
+
+  const targetPaths = [...new Set(plan.operations.flatMap((operation) => operation.targets.map((target) => target.path)))];
+  const backupRoot = backup([...targetPaths, mcpManifestPath]);
+  try {
+    for (const target of targets) {
+      const selected = plan.operations.filter((operation) => operation.targets.some((item) => item.binding === bindingId(target))).map((operation) => operation.server);
+      if (!selected.length) continue;
+      if (directTargets.has(target.harness)) removeDirectMcpServers(target.harness, target.path, selected);
+      else for (const name of selected) {
+        run(mcpNativeCliRemoveCommand(target.harness as "claude" | "grok" | "gemini", scope, name));
+        if (existsSync(target.path)) chmodSync(target.path, 0o600);
+      }
+    }
+    writeJsonAtomic(mcpManifestPath, scanMcpManifest(mcpSources(), readMcpManifest()));
+    cleanOldBackups();
+    const count = plan.operations.reduce((total, operation) => total + operation.targets.length, 0);
+    console.log(`Removed ${count} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
+  } catch (error) {
+    restoreBackup(backupRoot);
+    throw new Error(`MCP removal failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
+  }
+}
+
 function usage(): void {
-  console.log(`harness-sync [audit|init|instructions|add|remove|update|mcp]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
+  console.log(`harness-sync [audit|init|instructions|add|remove|update|mcp|mcp-remove]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
 }
 
 export function main(argv = process.argv.slice(2)): void {
@@ -1381,6 +1533,7 @@ export function main(argv = process.argv.slice(2)): void {
     if (command === "remove") return removeSkill(args[0] ?? "", args.slice(1));
     if (command === "update") return updateSkills(args, args);
     if (command === "mcp") return mcpSync(args);
+    if (command === "mcp-remove") return mcpRemove(args);
     usage();
     fail(`unknown command: ${command}`);
   } catch (error) {

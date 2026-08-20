@@ -42,3 +42,5 @@ Compare normalized transport, command, arguments, working directory, URL, enviro
 Every dry run emits a JSON plan with `apply: false` and `writes: []`. It contains paths, differing field names, and environment/header keys, never their values. A non-interactive unresolved conflict exits with code 2 and performs no writes. `--apply --confirmed` remains a separate write gate after the plan and conflict choices have been reviewed.
 
 Use `mcp --target <codex|claude|pi|grok|opencode|gemini|hermes|goose> --server <name>` to narrow a plan. Only installed targets are mutable.
+
+Use repeated `mcp-remove --server <name> --target <harness> --scope project|global` flags to remove exact bindings. Scope is mandatory. The dry run lists every affected path, missing binding, and native renderer without secret values. Removal preserves unrelated servers and unknown fields, backs up every affected config and the provenance manifest, restores them on failure, and refreshes provenance after success.
