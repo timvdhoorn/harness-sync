@@ -595,7 +595,7 @@ type InstructionsStatus = {
   root: string;
   agents: string;
   claude: string;
-  status: "missing-agents" | "missing-claude" | "correct-link" | "wrong-link" | "conflict";
+  status: "missing-agents" | "missing-claude" | "correct-link" | "correct-import" | "wrong-link" | "conflict";
 };
 
 function pathExists(path: string): boolean {
@@ -608,12 +608,30 @@ function projectRoot(): string {
   return result.exitCode === 0 ? result.stdout.toString().trim() : cwd;
 }
 
-export function inspectInstructions(root: string): InstructionsStatus {
-  const agents = join(root, "AGENTS.md");
-  const claude = join(root, "CLAUDE.md");
+export function inspectInstructions(root: string, agents = join(root, "AGENTS.md"), claude = join(root, "CLAUDE.md")): InstructionsStatus {
   if (!pathExists(agents)) return { root, agents, claude, status: "missing-agents" };
   if (!pathExists(claude)) return { root, agents, claude, status: "missing-claude" };
-  if (!lstatSync(claude).isSymbolicLink()) return { root, agents, claude, status: "conflict" };
+  if (!lstatSync(claude).isSymbolicLink()) {
+    if (!lstatSync(claude).isFile()) return { root, agents, claude, status: "conflict" };
+    let fence: string | undefined;
+    for (const line of readFileSync(claude, "utf8").split(/\r?\n/)) {
+      const marker = line.trim().match(/^(`{3,}|~{3,})/);
+      if (marker) {
+        if (!fence) fence = marker[1];
+        else if (marker[1][0] === fence[0] && marker[1].length >= fence.length) fence = undefined;
+        continue;
+      }
+      if (fence) continue;
+      const match = line.match(/^@(?:"([^"]+)"|'([^']+)'|([^\s]+))\s*$/);
+      if (!match) continue;
+      const source = match[1] ?? match[2] ?? match[3];
+      const imported = source.startsWith("~/") ? join(home, source.slice(2)) : resolve(dirname(claude), source);
+      try {
+        if (realpathSync(imported) === realpathSync(agents)) return { root, agents, claude, status: "correct-import" };
+      } catch { /* A missing or unrelated import is not a canonical wrapper. */ }
+    }
+    return { root, agents, claude, status: "conflict" };
+  }
   try {
     return { root, agents, claude, status: realpathSync(claude) === realpathSync(agents) ? "correct-link" : "wrong-link" };
   } catch {
@@ -621,9 +639,16 @@ export function inspectInstructions(root: string): InstructionsStatus {
   }
 }
 
+export function inspectUserInstructions(userHome: string): InstructionsStatus[] {
+  const targets = [inspectInstructions(userHome)];
+  const shared = join(userHome, ".agents", "AGENTS.md");
+  if (pathExists(shared)) targets.push(inspectInstructions(join(userHome, ".agents"), shared, join(userHome, ".claude", "CLAUDE.md")));
+  return targets;
+}
+
 function instructionTargets(scope: string): InstructionsStatus[] {
-  const roots = scope === "project" ? [projectRoot()] : scope === "user" ? [home] : [projectRoot(), home];
-  return [...new Set(roots)].map(inspectInstructions);
+  const targets = scope === "project" ? [inspectInstructions(projectRoot())] : scope === "user" ? inspectUserInstructions(home) : [inspectInstructions(projectRoot()), ...inspectUserInstructions(home)];
+  return targets.filter((item, index) => targets.findIndex((other) => other.claude === item.claude) === index);
 }
 
 function syncInstructions(args: string[]): void {
@@ -642,7 +667,8 @@ function syncInstructions(args: string[]): void {
   try {
     for (const item of changes) {
       if (pathExists(item.claude)) rmSync(item.claude, { recursive: true, force: true });
-      symlinkSync("AGENTS.md", item.claude);
+      mkdirSync(dirname(item.claude), { recursive: true });
+      symlinkSync(relative(dirname(item.claude), item.agents), item.claude);
     }
     cleanOldBackups();
     console.log(`Applied ${changes.length} instruction link(s). Backup: ${backupRoot}`);

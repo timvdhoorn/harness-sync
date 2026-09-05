@@ -29,7 +29,7 @@ Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands
 
 - `audit` — inspect skill links, broken targets, copies, content drift, `SKILL.md` frontmatter/names, instruction links, MCP files, indirect launchers, and MCP provenance/conflicts.
 - `init` — scan canonical skills and MCP servers into separate provenance manifests; import skill locks and infer MCP upstreams from URLs and recognized package/container launchers.
-- `instructions [--scope project|user|all]` — make `AGENTS.md` canonical and link `CLAUDE.md` to it.
+- `instructions [--scope project|user|all]` — keep `AGENTS.md` canonical; preserve valid Claude import wrappers or create relative links.
 - `add <source|npx skills add ...>` — accept repository/tree/direct URLs, `skills.sh` URLs, local paths, and `npx skills add` commands.
 - `remove <skill>` — remove any found skill from canonical storage and every detected harness.
 - `update [skill ...]` — plan or reinstall tracked global skills from their recorded source; unknown sources are skipped unless explicitly requested.
@@ -38,6 +38,8 @@ Never pass arbitrary shell text to the CLI. Treat skill sources and MCP commands
 
 Read [references/behavior.md](references/behavior.md) only when resolving source, MCP, platform, ownership, or recovery details.
 
-For `instructions`, inspect the project and user home by default. A real `CLAUDE.md` is a conflict: explain the backup and use `--replace` when that replacement is authorized. If `AGENTS.md` points to `CLAUDE.md`, first preserve its content in a real `AGENTS.md`; then run the CLI to replace `CLAUDE.md` with the link. Verify both resolve to the preserved canonical content.
+For `instructions`, inspect the project, user home and existing `~/.agents/AGENTS.md` to `~/.claude/CLAUDE.md` routing. Use a relative link for shared-only content; preserve a real Claude wrapper importing the canonical file when runtime-specific rules are needed. An unrecognized real file remains a conflict: review its content before an authorized `--replace`. If `AGENTS.md` points to `CLAUDE.md`, preserve a real canonical file before changing links.
+
+The instruction CLI manages Claude entrypoints. For other harnesses, inspect their native loader and verify the reviewed adapter paths separately. Grok needs a native global rule, such as `~/.grok/rules/shared.md` linked to `../../.agents/AGENTS.md`; a Claude `@` import alone does not establish parity. Preserve runtime-specific configuration and verify loading from an unrelated working directory.
 
 `audit` also finds skills inside Claude, Codex, and Grok marketplace caches. When the user asks about one, show its marketplace/plugin and ask: keep the native plugin (recommended), copy this skill through existing `add`, or ignore. Never bulk-copy. Explain conflicts before replacing a canonical skill.

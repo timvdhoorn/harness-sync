@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, harnesses, inferMcpScope, inferMcpUpstream, inspectInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, sourceForMcp, validSkillName } from "../scripts/harness-sync";
+import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, harnesses, inferMcpScope, inferMcpUpstream, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, sourceForMcp, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -979,6 +979,37 @@ describe("MCP provenance", () => {
 });
 
 describe("instruction files", () => {
+  test("preserves runtime-specific Claude wrappers with a canonical import", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    writeFileSync(join(root, "AGENTS.md"), "# Shared\n");
+    writeFileSync(join(root, "CLAUDE.md"), '@./AGENTS.md\n@RTK.md\n\n# Claude runtime\n');
+    expect(inspectInstructions(root).status).toBe("correct-import");
+    expect(readFileSync(join(root, "CLAUDE.md"), "utf8")).toContain("@RTK.md");
+  });
+
+  test("an example or unrelated import does not make a valid wrapper", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    writeFileSync(join(root, "AGENTS.md"), "# Shared\n");
+    writeFileSync(join(root, "other.md"), "# Other\n");
+    writeFileSync(join(root, "CLAUDE.md"), '```text\n@AGENTS.md\n```\n@other.md\n');
+    expect(inspectInstructions(root).status).toBe("conflict");
+  });
+
+  test("user scope inspects the shared agents directory and Claude wrapper", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    mkdirSync(join(root, ".agents"));
+    mkdirSync(join(root, ".claude"));
+    writeFileSync(join(root, ".agents", "AGENTS.md"), "# Shared\n");
+    writeFileSync(join(root, ".claude", "CLAUDE.md"), '@../.agents/AGENTS.md\n# Runtime\n');
+    const targets = inspectUserInstructions(root);
+    expect(targets.map((item) => item.status)).toEqual(["missing-agents", "correct-import"]);
+    expect(targets[1].claude).toBe(join(root, ".claude", "CLAUDE.md"));
+    expect(targets[1].agents).toBe(join(root, ".agents", "AGENTS.md"));
+  });
+
   test("AGENTS.md is canonical for CLAUDE.md", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);

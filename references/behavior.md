@@ -17,7 +17,9 @@ Use native MCP CLIs for Claude, Grok, and Gemini. Render Codex TOML, Pi JSON, Op
 
 ## Instruction files
 
-In projects, `AGENTS.md` is canonical and `CLAUDE.md` is a relative symlink to it. Apply the same rule in the user home when `~/AGENTS.md` exists. Preserve a real `CLAUDE.md` until the user explicitly confirms replacement; back it up before creating the link.
+Use a relative `CLAUDE.md` link for shared-only instructions. When Claude-specific imports or rules are needed, preserve a real wrapper importing the canonical `AGENTS.md`. The inspector recognizes a direct standalone import outside code fences that resolves to the canonical file; it does not execute or recursively expand imports. Unrecognized real files remain conflicts requiring reviewed replacement and backup.
+
+User scope checks `~/AGENTS.md` and, when present, `~/.agents/AGENTS.md` with `~/.claude/CLAUDE.md`. Other native runtime adapters require separate loader verification; the Claude instruction plan is not proof of cross-harness parity.
 
 ## Sources
 
