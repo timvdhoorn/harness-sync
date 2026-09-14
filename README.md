@@ -69,10 +69,10 @@ run:
 ```
 
 With no additional command, the agent starts with a read-only audit. It explains
-the findings, recommends one next action, and asks one question at a time. When a
-change is needed, the agent shows the exact files, scope, conflicts, and secret
-movement before asking for confirmation. You do not need to construct the CLI
-commands yourself.
+the findings and selects the next action from your request. Before applying a
+change, it shows the exact files, scope, conflicts, and secret movement. Existing
+authorization covers the reviewed batch; the agent asks when scope or permission
+is missing. You do not need to construct the CLI commands yourself.
 
 You can also give the skill a specific job in plain language:
 
@@ -102,6 +102,22 @@ Start with a read-only audit:
 ```bash
 bun run scripts/harness-sync.ts audit
 ```
+
+When auditing another project, keep that project's working directory and pass
+the absolute path to `scripts/harness-sync.ts`. The script location selects the
+CLI; the working directory selects the project scope.
+
+For a machine check that fails on actionable drift:
+
+```bash
+bun run scripts/harness-sync.ts audit --strict --json
+```
+
+Strict mode exits with code 1 for actionable findings and 0 for a clean check.
+Unknown provenance and absent optional harnesses remain informational. It checks
+the complete current inventory, including user-level configuration; it has no
+scope filter. The default audit remains informational, and `bun run check` keeps
+that default so unrelated machine drift does not fail the repository's checks.
 
 Preview the provenance records that `init` would create for the skills and MCP
 servers already installed:

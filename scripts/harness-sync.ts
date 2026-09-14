@@ -42,11 +42,14 @@ type Harness = {
 export type McpSource = { harness: string; path: string; scope: "project" | "global" };
 type SkillIssue = { path: string; issue: string };
 type MarketplaceSkill = { name: string; hash: string; status: "available" | "canonical" | "conflict"; sources: Array<{ harness: string; marketplace: string; plugin: string; path: string }> };
+type StrictAuditFinding = { code: string; path: string; server?: string; field?: string; scope?: McpSource["scope"] };
+type StrictAuditSummary = { actionable: boolean; findings: StrictAuditFinding[] };
 export type TrackedSkill = {
   source: string | null;
   sourceType: string | null;
   sourceUrl: string | null;
   skillPath: string | null;
+  installSource?: string;
   fullDepth?: boolean;
   version: string;
   contentHash: string;
@@ -301,6 +304,7 @@ export function scanSkillManifest(
       sourceType: lock?.sourceType ?? prior?.sourceType ?? null,
       sourceUrl: lock?.sourceUrl ?? prior?.sourceUrl ?? null,
       skillPath: lock?.skillPath ?? prior?.skillPath ?? null,
+      ...(prior?.installSource ? { installSource: prior.installSource } : {}),
       ...(prior?.fullDepth ? { fullDepth: true } : {}),
       version: lock?.skillFolderHash ?? (prior?.contentHash === contentHash ? prior.version : contentHash),
       contentHash,
@@ -333,6 +337,51 @@ function skillMetadataIssue(path: string, directoryName: string): string | undef
 
 export function validSkillName(name: string): boolean {
   return /^[a-z0-9][a-z0-9-]{0,63}$/.test(name);
+}
+
+export function embeddedSkillPaths(skillDir: string): string[] {
+  const embedded: string[] = [];
+  const visit = (path: string) => {
+    for (const name of readdirSync(path).sort()) {
+      if (name === ".git" || name === "node_modules") continue;
+      const child = join(path, name);
+      let info;
+      try { info = lstatSync(child); } catch { continue; }
+      if (!info.isDirectory() || info.isSymbolicLink()) continue;
+      if (existsSync(join(child, "SKILL.md"))) embedded.push(relative(skillDir, join(child, "SKILL.md")));
+      visit(child);
+    }
+  };
+  if (pathExists(skillDir)) visit(skillDir);
+  return embedded;
+}
+
+export function inspectCanonicalSkillDirectory(canonicalDir = canonicalSkills): SkillIssue[] {
+  if (!pathExists(canonicalDir)) return [{ path: canonicalDir, issue: "missing-directory" }];
+  return readdirSync(canonicalDir).sort().flatMap((name) => {
+    const path = join(canonicalDir, name);
+    if (name.startsWith(".")) return [];
+    let info;
+    try { info = lstatSync(path); } catch { return []; }
+    if (!info.isDirectory() && !info.isSymbolicLink()) return [];
+    const metadataIssue = skillMetadataIssue(path, name);
+    const issues: SkillIssue[] = metadataIssue ? [{ path, issue: metadataIssue }] : [];
+    return issues.concat(embeddedSkillPaths(path).map((embedded) => ({
+      path: join(path, embedded),
+      issue: "embedded-skill",
+    })));
+  });
+}
+
+function assertStandaloneSkills(names: Iterable<string>): void {
+  const issues = [...new Set(names)].flatMap((name) => embeddedSkillPaths(join(canonicalSkills, name)).map((path) => `${name}/${path}`));
+  if (issues.length) {
+    throw new Error(`installed skill contains embedded skills (${issues.join(", ")}); use a repository tree URL that points to the standalone skill directory`);
+  }
+}
+
+export function skillInstallSource(item: TrackedSkill): string | null {
+  return item.installSource ?? item.source;
 }
 
 function detectedHarnesses(): Array<Harness & { installed: boolean }> {
@@ -678,20 +727,79 @@ function syncInstructions(args: string[]): void {
   }
 }
 
-function audit(asJson: boolean): void {
-  const canonicalIssues = pathExists(canonicalSkills)
-    ? readdirSync(canonicalSkills).sort().flatMap((name) => {
-      const path = join(canonicalSkills, name);
-      if (name.startsWith(".") || !lstatSync(path).isDirectory() && !lstatSync(path).isSymbolicLink()) return [];
-      const issue = skillMetadataIssue(path, name);
-      return issue ? [{ path, issue }] : [];
-    })
-    : [{ path: canonicalSkills, issue: "missing-directory" }];
+function strictSkillIssueCode(issue: string, canonical: boolean): string | undefined {
+  if (issue === "missing-directory") return canonical ? "canonical-missing" : undefined;
+  if (issue === "embedded-skill") return canonical ? "canonical-nested-skill" : "skill-nested-skill";
+  if (["broken-directory-link", "wrong-directory-link", "broken-skill-link", "wrong-skill-link"].includes(issue)) {
+    return `skill-${issue}`;
+  }
+  if (issue === "copy-drift") return "skill-copy-drift";
+  if (issue === "copy" || issue === "untracked-copy") return undefined;
+  return canonical || issue.includes("SKILL.md") || issue.includes("frontmatter") || issue.startsWith("name-mismatch:")
+    ? canonical ? "canonical-invalid-metadata" : "skill-invalid-metadata"
+    : undefined;
+}
+
+function sameScopeMcpConflictFindings(manifest: McpManifest): StrictAuditFinding[] {
+  const findings: StrictAuditFinding[] = [];
+  for (const [server, item] of Object.entries(manifest.servers)) {
+    if (!item.conflict) continue;
+    for (const scope of ["project", "global"] as const) {
+      const installations = item.installations.filter((installation) => installation.scope === scope);
+      const hashes = new Set(installations.map((installation) => installation.effectiveConfigHash ?? installation.configHash));
+      if (hashes.size > 1 && installations[0]) {
+        findings.push({ code: "mcp-same-scope-conflict", path: installations[0].path, server, scope });
+      }
+    }
+  }
+  return findings;
+}
+
+function classifyStrictAudit(
+  canonicalExists: boolean,
+  canonicalIssues: SkillIssue[],
+  skills: Array<{ issues: SkillIssue[] }>,
+  mcpIssues: McpAuditIssue[],
+  mcpManifest: McpManifest,
+  instructions: InstructionsStatus[],
+): StrictAuditSummary {
+  const findings: StrictAuditFinding[] = [];
+  if (!canonicalExists && !canonicalIssues.some((item) => item.issue === "missing-directory")) {
+    findings.push({ code: "canonical-missing", path: canonicalSkills });
+  }
+  for (const item of canonicalIssues) {
+    const code = strictSkillIssueCode(item.issue, true);
+    if (code) findings.push({ code, path: item.path });
+  }
+  for (const skill of skills) {
+    for (const item of skill.issues) {
+      const code = strictSkillIssueCode(item.issue, false);
+      if (code) findings.push({ code, path: item.path });
+    }
+  }
+  for (const item of mcpIssues) {
+    findings.push({ code: `mcp-${item.issue}`, path: item.path, server: item.server, field: item.field });
+  }
+  findings.push(...sameScopeMcpConflictFindings(mcpManifest));
+  for (const item of instructions) {
+    if (item.status === "missing-claude") findings.push({ code: "instructions-missing-claude", path: item.claude });
+    else if (item.status === "wrong-link") findings.push({ code: "instructions-wrong-link", path: item.claude });
+    else if (item.status === "conflict") findings.push({ code: "instructions-conflict", path: item.claude });
+  }
+  return { actionable: findings.length > 0, findings };
+}
+
+function redactMcpAuditIssues(issues: McpAuditIssue[]): McpAuditIssue[] {
+  return issues.map((item) => ({ ...item, value: "[redacted]" }));
+}
+
+function audit(asJson: boolean, strict = false): void {
+  const canonicalIssues = inspectCanonicalSkillDirectory(canonicalSkills);
   const skills = detectedHarnesses().map(({ id, installed, skillDir }) => ({ id, installed, skillDir, issues: inspectSkillDirectory(skillDir) }));
   const marketplaceSkills = discoverMarketplaceSkills();
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
   const mcpManifest = scanMcpManifest(mcpSources(), readMcpManifest());
-  const mcpIssues = inspectMcpConfigurations(mcpSources());
+  const mcpIssues = redactMcpAuditIssues(inspectMcpConfigurations(mcpSources()));
   const mcpProvenance = {
     path: mcpManifestPath,
     exists: existsSync(mcpManifestPath),
@@ -702,7 +810,11 @@ function audit(asJson: boolean): void {
   };
   const instructions = instructionTargets("all");
   const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, mcpIssues, instructions };
-  if (asJson) console.log(JSON.stringify(result, null, 2));
+  const strictSummary = strict
+    ? classifyStrictAudit(result.canonicalExists, canonicalIssues, skills, mcpIssues, mcpManifest, instructions)
+    : undefined;
+  const output = strict ? { ...result, strict: strictSummary } : result;
+  if (asJson) console.log(JSON.stringify(output, null, 2));
   else {
     console.log(`Canonical skills: ${canonicalSkills} (${result.canonicalExists ? "ok" : "missing"})`);
     if (canonicalIssues.length) console.log(`canonical issues: ${canonicalIssues.length}`);
@@ -725,7 +837,9 @@ function audit(asJson: boolean): void {
       }
     }
     for (const item of instructions) console.log(`instructions ${item.root}: ${item.status}`);
+    if (strictSummary) console.log(`Strict audit: ${strictSummary.actionable ? `${strictSummary.findings.length} actionable finding(s)` : "clean"}`);
   }
+  if (strict) process.exitCode = strictSummary?.actionable ? 1 : 0;
 }
 
 function tokenize(command: string): string[] {
@@ -782,9 +896,15 @@ function addSkill(args: string[]): void {
     const after = scanSkillManifest(canonicalSkills, globalSkillLocks(), before);
     const selectedIndex = sourceArgs.indexOf("--skill");
     const selected = selectedIndex >= 0 ? new Set(sourceArgs.slice(selectedIndex + 1).filter((item) => !item.startsWith("--"))) : null;
-    for (const [name, item] of Object.entries(after.skills)) {
-      if ((selected?.has(name) || before.skills[name]?.contentHash !== item.contentHash || !before.skills[name]) && item.source) {
+    const affected = Object.entries(after.skills)
+      .filter(([name, item]) => selected?.has(name) || before.skills[name]?.contentHash !== item.contentHash || !before.skills[name])
+      .map(([name]) => name);
+    assertStandaloneSkills(affected);
+    for (const name of affected) {
+      const item = after.skills[name];
+      if (item.source) {
         item.provenance = "install";
+        item.installSource = sourceArgs[0];
         if (sourceArgs.includes("--full-depth")) item.fullDepth = true;
       }
     }
@@ -848,7 +968,7 @@ function updateSkills(names: string[], args: string[]): void {
   if (missing.length) fail(`skills not found in manifest; run init first: ${missing.join(", ")}`);
   const unknown = requested.filter((name) => !manifest.skills[name].source);
   const tracked = requested.filter((name) => manifest.skills[name].source);
-  for (const name of tracked) console.log(`Plan: update ${name} from ${manifest.skills[name].source} (current ${manifest.skills[name].version})`);
+  for (const name of tracked) console.log(`Plan: update ${name} from ${skillInstallSource(manifest.skills[name])} (current ${manifest.skills[name].version})`);
   if (unknown.length) console.log(`Skip (unknown source): ${unknown.join(", ")}`);
   if (cleanNames.length && unknown.length) fail(`cannot update skills with unknown source: ${unknown.join(", ")}`);
   if (!apply) return;
@@ -857,9 +977,10 @@ function updateSkills(names: string[], args: string[]): void {
   try {
     for (const name of tracked) {
       const item = manifest.skills[name];
-      run(["npx", "--yes", "skills", "add", item.source!, "--skill", name, ...(item.fullDepth ? ["--full-depth"] : []), "-g", "-y", "--agent", ...agents]);
+      run(["npx", "--yes", "skills", "add", skillInstallSource(item)!, "--skill", name, ...(item.fullDepth ? ["--full-depth"] : []), "-g", "-y", "--agent", ...agents]);
     }
     const refreshed = scanSkillManifest(canonicalSkills, globalSkillLocks(), manifest);
+    assertStandaloneSkills(tracked);
     for (const name of tracked) refreshed.skills[name].provenance = "install";
     writeJsonAtomic(skillManifestPath, refreshed);
     cleanOldBackups();
@@ -1629,14 +1750,34 @@ function mcpRemove(args: string[]): void {
 }
 
 function usage(): void {
-  console.log(`harness-sync [audit|init|instructions|add|remove|update|mcp|mcp-remove]\n\nRecommended: audit\nRun a command without --apply for a plan. Writes require --apply --confirmed.`);
+  console.log(`harness-sync [audit|init|instructions|add|remove|update|mcp|mcp-remove]
+
+Commands:
+  audit [--strict] [--json]
+  init
+  instructions [--scope project|user|all] [--replace]
+  add <source|npx skills add ...> [--skill <name>...] [--full-depth]
+  remove <skill>
+  update [skill ...]
+  mcp [--from auto|catalog|<harness>|<path>] [--target <harness>]...
+      [--scope auto|project|global] [--server <name>]
+      [--resolve <server>=source|target:<harness>|merge|skip]...
+      [--direct] [--non-interactive]
+  mcp-remove --server <name>... --target <harness>... --scope project|global
+
+Harnesses: ${harnesses.map((item) => item.id).join(", ")}
+MCP sync also accepts catalog as a target. Repeat --server/--target flags for removal.
+Recommended: audit
+Strict audit exits 1 for actionable findings; default audit reports without failing.
+Audit checks the complete inventory, including user state; it has no scope filter.
+Run a mutation command without --apply for a plan. Writes require --apply --confirmed.`);
 }
 
 export function main(argv = process.argv.slice(2)): void {
   const [command, ...args] = argv;
   try {
     if (!command || command === "--help" || command === "-h") return usage();
-    if (command === "audit") return audit(args.includes("--json"));
+    if (command === "audit") return audit(args.includes("--json"), args.includes("--strict"));
     if (command === "init") return initState(args);
     if (command === "instructions") return syncInstructions(args);
     if (command === "add") return addSkill(args);

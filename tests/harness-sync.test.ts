@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, harnesses, inferMcpScope, inferMcpUpstream, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, sourceForMcp, validSkillName } from "../scripts/harness-sync";
+import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, embeddedSkillPaths, harnesses, inferMcpScope, inferMcpUpstream, inspectCanonicalSkillDirectory, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, skillInstallSource, sourceForMcp, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -56,6 +56,7 @@ describe("skill provenance", () => {
     writeFileSync(join(canonical, "demo", "SKILL.md"), "---\nname: demo\n---\ndemo");
     const first = scanSkillManifest(canonical, [], { version: 1, skills: {} }, "first");
     first.skills.demo.source = "owner/repo";
+    first.skills.demo.installSource = "https://github.com/owner/repo/tree/main/skills/demo";
     first.skills.demo.provenance = "install";
     first.skills.demo.fullDepth = true;
     const second = scanSkillManifest(canonical, [], first, "second");
@@ -63,7 +64,9 @@ describe("skill provenance", () => {
     expect(second.skills.demo.version).toBe(first.skills.demo.version);
     expect(second.skills.demo.updatedAt).toBe("first");
     expect(second.skills.demo.provenance).toBe("install");
+    expect(second.skills.demo.installSource).toBe("https://github.com/owner/repo/tree/main/skills/demo");
     expect(second.skills.demo.fullDepth).toBeTrue();
+    expect(skillInstallSource(second.skills.demo)).toBe("https://github.com/owner/repo/tree/main/skills/demo");
   });
 });
 
@@ -96,6 +99,20 @@ describe("skill removal", () => {
 });
 
 describe("skill audit", () => {
+  test("finds repository copies that embed other skills", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const canonical = join(root, "canonical");
+    mkdirSync(join(canonical, "outer", "skills", "inner"), { recursive: true });
+    writeFileSync(join(canonical, "outer", "SKILL.md"), "---\nname: outer\n---\nouter");
+    writeFileSync(join(canonical, "outer", "skills", "inner", "SKILL.md"), "---\nname: inner\n---\ninner");
+    expect(embeddedSkillPaths(join(canonical, "outer"))).toEqual(["skills/inner/SKILL.md"]);
+    expect(inspectCanonicalSkillDirectory(canonical)).toEqual([{
+      path: join(canonical, "outer", "skills", "inner", "SKILL.md"),
+      issue: "embedded-skill",
+    }]);
+  });
+
   test("finds wrong links and drifted copies", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);
