@@ -140,6 +140,19 @@ describe("strict audit CLI", () => {
     expect(audit.strict.findings).toContainEqual({ code: "skill-wrong-directory-link", path: join(root, ".codex/skills") });
   });
 
+  test("fails on a redundant OpenCode adapter to native agent skills", () => {
+    const root = fixture();
+    mkdirSync(join(root, ".config", "opencode"), { recursive: true });
+    symlinkSync("../../.agents/skills", join(root, ".config", "opencode", "skills"));
+    writeFileSync(join(root, "bin", "opencode"), "#!/bin/sh\n");
+    const { result, audit } = auditJson(root);
+    expect(result.exitCode).toBe(1);
+    expect(audit.strict.findings).toContainEqual({
+      code: "skill-redundant-directory-link",
+      path: join(root, ".config", "opencode", "skills"),
+    });
+  });
+
   test.each(["missing", "conflict", "wrong-link"])("fails on a %s Claude entrypoint when canonical instructions exist", (state) => {
     const root = fixture();
     write(root, "project/AGENTS.md", "Project instructions\n");

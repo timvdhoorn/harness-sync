@@ -23,6 +23,8 @@ Strict audit is an inventory check, not a scoped synchronization plan or proof t
 
 Detect Codex, Claude Code, Pi, Grok, OpenCode, Gemini, Hermes, and Goose. Default mutation targets are installed harnesses. An explicitly selected target with a direct native renderer may be updated without its CLI; CLI-backed targets still require the executable. OMP is outside scope.
 
+OpenCode discovers canonical `~/.agents/skills` itself. Keep it out of the `npx skills --agent` targets and do not create `~/.config/opencode/skills` as a second adapter. Audit a legacy symlink that resolves to the canonical directory as redundant drift; back it up and remove the symlink only after the reviewed plan authorizes that exact path. Preserve a real OpenCode skill directory because it may contain intentional runtime-specific overrides.
+
 Use native MCP CLIs for Claude, Grok, and Gemini. Render Codex TOML, Pi JSON, OpenCode JSON, Hermes YAML, and Goose YAML while preserving unrelated config. Detect OpenCode stable and v2 shapes separately. After every native write, keep the target config private with mode `0600`.
 
 ## Instruction files

@@ -22,6 +22,10 @@ specific home directory.
 - Marketplace skill discovery without bulk copying plugin contents
 - Backups and automatic recovery when an apply fails
 
+OpenCode reads the canonical `.agents` directory directly. Harness Sync does not
+create a second `~/.config/opencode/skills` adapter, because current OpenCode
+versions would load every skill twice.
+
 Harness Sync compares MCP definitions by behavior, not just by server name. The
 comparison includes transport, command, arguments, working directory, URL,
 environment keys, headers, and enabled state. Project and global definitions

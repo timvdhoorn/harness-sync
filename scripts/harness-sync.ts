@@ -35,6 +35,8 @@ type Harness = {
   id: string;
   executable: string;
   skillDir: string;
+  nativeSkills?: boolean;
+  legacySkillDir?: string;
   mcpFiles: string[];
   npxAgent?: string;
 };
@@ -156,7 +158,14 @@ export const harnesses: Harness[] = [
   { id: "claude", executable: "claude", skillDir: join(home, ".claude", "skills"), mcpFiles: [join(cwd, ".mcp.json"), join(home, ".claude.json")], npxAgent: "claude-code" },
   { id: "pi", executable: "pi", skillDir: join(home, ".pi", "agent", "skills"), mcpFiles: [join(home, ".pi", "mcp", "mcp.json")], npxAgent: "pi" },
   { id: "grok", executable: "grok", skillDir: join(home, ".grok", "skills"), mcpFiles: [join(cwd, ".grok", "config.toml"), join(home, ".grok", "config.toml")], npxAgent: "grok" },
-  { id: "opencode", executable: "opencode", skillDir: join(home, ".config", "opencode", "skills"), mcpFiles: [join(cwd, ".opencode", "opencode.json"), join(home, ".config", "opencode", "opencode.json")], npxAgent: "opencode" },
+  {
+    id: "opencode",
+    executable: "opencode",
+    skillDir: canonicalSkills,
+    nativeSkills: true,
+    legacySkillDir: join(home, ".config", "opencode", "skills"),
+    mcpFiles: [join(cwd, ".opencode", "opencode.json"), join(home, ".config", "opencode", "opencode.json")],
+  },
   { id: "gemini", executable: "gemini", skillDir: join(home, ".gemini", "skills"), mcpFiles: [join(cwd, ".gemini", "settings.json"), join(home, ".gemini", "settings.json")], npxAgent: "gemini-cli" },
   { id: "hermes", executable: "hermes", skillDir: join(home, ".hermes", "skills"), mcpFiles: [join(home, ".hermes", "config.yaml")], npxAgent: "hermes-agent" },
   { id: "goose", executable: "goose", skillDir: join(home, ".config", "goose", "skills"), mcpFiles: [join(home, ".config", "goose", "config.yaml")], npxAgent: "goose" },
@@ -343,7 +352,7 @@ export function embeddedSkillPaths(skillDir: string): string[] {
   const embedded: string[] = [];
   const visit = (path: string) => {
     for (const name of readdirSync(path).sort()) {
-      if (name === ".git" || name === "node_modules") continue;
+      if (name.startsWith(".") || name === "node_modules") continue;
       const child = join(path, name);
       let info;
       try { info = lstatSync(child); } catch { continue; }
@@ -421,6 +430,21 @@ export function inspectSkillDirectory(skillDir: string, canonicalDir = canonical
     }
   }
   return issues;
+}
+
+export function inspectHarnessSkillDirectory(
+  harness: Pick<Harness, "skillDir" | "nativeSkills" | "legacySkillDir">,
+  canonicalDir = canonicalSkills,
+): SkillIssue[] {
+  if (!harness.nativeSkills) return inspectSkillDirectory(harness.skillDir, canonicalDir);
+  const legacy = harness.legacySkillDir;
+  if (!legacy || !pathExists(legacy)) return [];
+  try {
+    if (lstatSync(legacy).isSymbolicLink() && realpathSync(legacy) === realpathSync(canonicalDir)) {
+      return [{ path: legacy, issue: "redundant-directory-link" }];
+    }
+  } catch { /* a broken legacy path is not part of native skill discovery */ }
+  return [];
 }
 
 export function discoverMarketplaceSkills(
@@ -734,6 +758,7 @@ function strictSkillIssueCode(issue: string, canonical: boolean): string | undef
     return `skill-${issue}`;
   }
   if (issue === "copy-drift") return "skill-copy-drift";
+  if (issue === "redundant-directory-link") return "skill-redundant-directory-link";
   if (issue === "copy" || issue === "untracked-copy") return undefined;
   return canonical || issue.includes("SKILL.md") || issue.includes("frontmatter") || issue.startsWith("name-mismatch:")
     ? canonical ? "canonical-invalid-metadata" : "skill-invalid-metadata"
@@ -795,7 +820,12 @@ function redactMcpAuditIssues(issues: McpAuditIssue[]): McpAuditIssue[] {
 
 function audit(asJson: boolean, strict = false): void {
   const canonicalIssues = inspectCanonicalSkillDirectory(canonicalSkills);
-  const skills = detectedHarnesses().map(({ id, installed, skillDir }) => ({ id, installed, skillDir, issues: inspectSkillDirectory(skillDir) }));
+  const skills = detectedHarnesses().map((harness) => ({
+    id: harness.id,
+    installed: harness.installed,
+    skillDir: harness.skillDir,
+    issues: inspectHarnessSkillDirectory(harness),
+  }));
   const marketplaceSkills = discoverMarketplaceSkills();
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
   const mcpManifest = scanMcpManifest(mcpSources(), readMcpManifest());

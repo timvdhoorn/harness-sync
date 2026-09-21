@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, embeddedSkillPaths, harnesses, inferMcpScope, inferMcpUpstream, inspectCanonicalSkillDirectory, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, skillInstallSource, sourceForMcp, validSkillName } from "../scripts/harness-sync";
+import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, embeddedSkillPaths, harnesses, inferMcpScope, inferMcpUpstream, inspectCanonicalSkillDirectory, inspectHarnessSkillDirectory, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, skillInstallSource, sourceForMcp, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -99,6 +99,27 @@ describe("skill removal", () => {
 });
 
 describe("skill audit", () => {
+  test("uses OpenCode native .agents discovery and reports the legacy duplicate adapter", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const canonical = join(root, ".agents", "skills");
+    const legacy = join(root, ".config", "opencode", "skills");
+    mkdirSync(canonical, { recursive: true });
+    mkdirSync(join(root, ".config", "opencode"), { recursive: true });
+    symlinkSync("../../.agents/skills", legacy);
+    expect(inspectHarnessSkillDirectory({
+      skillDir: canonical,
+      nativeSkills: true,
+      legacySkillDir: legacy,
+    }, canonical)).toEqual([{ path: legacy, issue: "redundant-directory-link" }]);
+    const opencode = harnesses.find((item) => item.id === "opencode");
+    expect(opencode).toMatchObject({
+      skillDir: expect.stringContaining("/.agents/skills"),
+      nativeSkills: true,
+    });
+    expect(opencode?.npxAgent).toBeUndefined();
+  });
+
   test("finds repository copies that embed other skills", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);
@@ -111,6 +132,16 @@ describe("skill audit", () => {
       path: join(canonical, "outer", "skills", "inner", "SKILL.md"),
       issue: "embedded-skill",
     }]);
+  });
+
+  test("ignores hidden worktree storage inside a canonical skill", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const skill = join(root, "demo");
+    mkdirSync(join(skill, ".worktrees", "task"), { recursive: true });
+    writeFileSync(join(skill, "SKILL.md"), "---\nname: demo\n---\n");
+    writeFileSync(join(skill, ".worktrees", "task", "SKILL.md"), "---\nname: nested\n---\n");
+    expect(embeddedSkillPaths(skill)).toEqual([]);
   });
 
   test("finds wrong links and drifted copies", () => {
