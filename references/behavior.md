@@ -27,6 +27,14 @@ OpenCode discovers canonical `~/.agents/skills` itself. Keep it out of the `npx 
 
 Use native MCP CLIs for Claude, Grok, and Gemini. Render Codex TOML, Pi JSON, OpenCode JSON, Hermes YAML, and Goose YAML while preserving unrelated config. Detect OpenCode stable and v2 shapes separately. After every native write, keep the target config private with mode `0600`.
 
+## Shared hook configuration
+
+Treat hooks loaded from a synchronized settings file as cross-machine configuration, even when another harness loads them through compatibility behavior. Inventory every hook command before changing that file. Absolute home paths under `/Users/<name>` or `/home/<name>` are non-portable drift; use a shell-expanded `${HOME}` path when the hook format supports it. Symlink text does not expand home variables.
+
+Keep machine-local binaries out of shared hook settings. When an optional helper is intentionally shared, guard its executable or script lookup and return the harness's harmless success shape when it is absent. A missing optional helper must not block prompts. Remove a hook only when the reviewed plan identifies its exact event and command, and back up both the settings file and any script being removed.
+
+After a hook change, validate the settings syntax, confirm that the removed command and foreign home literals are absent, then start each affected harness from an unrelated directory on every named machine and submit a harmless prompt. A successful config parse or file sync is not evidence that the harness accepted a turn. If a named machine is unavailable, report that verification gap instead of claiming cross-machine completion.
+
 ## Instruction files
 
 Use a relative `CLAUDE.md` link for shared-only instructions. When Claude-specific imports or rules are needed, preserve a real wrapper importing the canonical `AGENTS.md`. The inspector recognizes a direct standalone import outside code fences that resolves to the canonical file; it does not execute or recursively expand imports. Unrecognized real files remain conflicts requiring reviewed replacement and backup. If `AGENTS.md` points to `CLAUDE.md`, preserve a real canonical file before changing links.
