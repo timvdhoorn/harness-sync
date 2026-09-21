@@ -23,7 +23,25 @@ Strict audit is an inventory check, not a scoped synchronization plan or proof t
 
 Detect Codex, Claude Code, Pi, Grok, OpenCode, Gemini, Hermes, and Goose. Default mutation targets are installed harnesses. An explicitly selected target with a direct native renderer may be updated without its CLI; CLI-backed targets still require the executable. OMP is outside scope.
 
+OpenCode discovers canonical `~/.agents/skills` itself. Keep it out of the `npx skills --agent` targets and do not create `~/.config/opencode/skills` as a second adapter. Audit a legacy symlink that resolves to the canonical directory as redundant drift; back it up and remove the symlink only after the reviewed plan authorizes that exact path. Preserve a real OpenCode skill directory because it may contain intentional runtime-specific overrides.
+
 Use native MCP CLIs for Claude, Grok, and Gemini. Render Codex TOML, Pi JSON, OpenCode JSON, Hermes YAML, and Goose YAML while preserving unrelated config. Detect OpenCode stable and v2 shapes separately. After every native write, keep the target config private with mode `0600`.
+
+## Shared hook configuration
+
+Treat hooks loaded from a synchronized settings file as cross-machine configuration, even when another harness loads them through compatibility behavior. Inventory every hook command before changing that file. Absolute home paths under `/Users/<name>` or `/home/<name>` are non-portable drift; use a shell-expanded `${HOME}` path when the hook format supports it. Symlink text does not expand home variables.
+
+Keep machine-local binaries out of shared hook settings. When an optional helper is intentionally shared, guard its executable or script lookup and return the harness's harmless success shape when it is absent. A missing optional helper must not block prompts. Remove a hook only when the reviewed plan identifies its exact event and command, and back up both the settings file and any script being removed.
+
+After a hook change, validate the settings syntax, confirm that the removed command and foreign home literals are absent, then start each affected harness from an unrelated directory on every named machine and submit a harmless prompt. A successful config parse or file sync is not evidence that the harness accepted a turn. If a named machine is unavailable, report that verification gap instead of claiming cross-machine completion.
+
+## Portable configuration
+
+Treat a synchronized source and a harness-owned target as separate artifacts. Register the source and target with `portable-config register`; seed a new source from a reviewed existing target only after its hook portability check passes. The manifest stores home-relative `~/` locations and contains no config values. Registration adds the generated target as an exact root-relative entry in the enclosing Syncthing `.stignore`.
+
+Render with `portable-config render`. Rendering validates JSON and shared hooks, backs up the target and ignore file, copies without interpolating `~` or `${HOME}`, writes mode `0600`, and rolls back on any remaining source, drift, or ignore finding. This preserves format-specific expansion: shell hook commands may expand `${HOME}`, symlink targets remain relative, executables resolve through `PATH`, and formats without expansion receive a machine-local rendered value.
+
+Run `doctor --strict --json` on each named host. Compare host, platform, architecture, installed harnesses, hook findings and portable-config findings; the report omits config values and commands. Zero findings proves local rendering and portability, not runtime loading. Follow with the Shared hook configuration prompt check. An unreachable host remains an explicit verification gap.
 
 ## Instruction files
 

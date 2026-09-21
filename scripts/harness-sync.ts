@@ -2,7 +2,9 @@
 
 import { createHash } from "node:crypto";
 import {
+  accessSync,
   chmodSync,
+  constants,
   cpSync,
   existsSync,
   lstatSync,
@@ -17,8 +19,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, platform } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { arch, homedir, hostname, platform } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 export type McpServer = {
   command?: string;
@@ -35,14 +37,30 @@ type Harness = {
   id: string;
   executable: string;
   skillDir: string;
+  nativeSkills?: boolean;
+  legacySkillDir?: string;
   mcpFiles: string[];
   npxAgent?: string;
 };
 
 export type McpSource = { harness: string; path: string; scope: "project" | "global" };
 type SkillIssue = { path: string; issue: string };
+export type HookAuditIssue = {
+  issue: "invalid-json" | "absolute-home-path" | "machine-local-executable" | "missing-target";
+  path: string;
+  event: string;
+  hook: number;
+  field: "command";
+};
+export type PortableConfigEntry = { source: string; target: string; format: "json" | "text"; mode: "0600" };
+export type PortableConfigManifest = { version: 1; configs: Record<string, PortableConfigEntry> };
+export type PortableConfigIssue = {
+  issue: "source-missing" | "target-missing" | "target-drift" | "target-not-ignored" | "source-non-portable";
+  id: string;
+  path: string;
+};
 type MarketplaceSkill = { name: string; hash: string; status: "available" | "canonical" | "conflict"; sources: Array<{ harness: string; marketplace: string; plugin: string; path: string }> };
-type StrictAuditFinding = { code: string; path: string; server?: string; field?: string; scope?: McpSource["scope"] };
+type StrictAuditFinding = { code: string; path: string; server?: string; field?: string; scope?: McpSource["scope"]; event?: string; hook?: number; id?: string };
 type StrictAuditSummary = { actionable: boolean; findings: StrictAuditFinding[] };
 export type TrackedSkill = {
   source: string | null;
@@ -149,6 +167,7 @@ const stateRoot = process.env.XDG_STATE_HOME
 const canonicalSkills = join(home, ".agents", "skills");
 const skillManifestPath = join(stateRoot, "skills.json");
 const mcpManifestPath = join(stateRoot, "mcps.json");
+const portableConfigManifestPath = join(home, ".agents", "harness-sync", "portable-configs.json");
 const cwd = process.cwd();
 
 export const harnesses: Harness[] = [
@@ -156,7 +175,14 @@ export const harnesses: Harness[] = [
   { id: "claude", executable: "claude", skillDir: join(home, ".claude", "skills"), mcpFiles: [join(cwd, ".mcp.json"), join(home, ".claude.json")], npxAgent: "claude-code" },
   { id: "pi", executable: "pi", skillDir: join(home, ".pi", "agent", "skills"), mcpFiles: [join(home, ".pi", "mcp", "mcp.json")], npxAgent: "pi" },
   { id: "grok", executable: "grok", skillDir: join(home, ".grok", "skills"), mcpFiles: [join(cwd, ".grok", "config.toml"), join(home, ".grok", "config.toml")], npxAgent: "grok" },
-  { id: "opencode", executable: "opencode", skillDir: join(home, ".config", "opencode", "skills"), mcpFiles: [join(cwd, ".opencode", "opencode.json"), join(home, ".config", "opencode", "opencode.json")], npxAgent: "opencode" },
+  {
+    id: "opencode",
+    executable: "opencode",
+    skillDir: canonicalSkills,
+    nativeSkills: true,
+    legacySkillDir: join(home, ".config", "opencode", "skills"),
+    mcpFiles: [join(cwd, ".opencode", "opencode.json"), join(home, ".config", "opencode", "opencode.json")],
+  },
   { id: "gemini", executable: "gemini", skillDir: join(home, ".gemini", "skills"), mcpFiles: [join(cwd, ".gemini", "settings.json"), join(home, ".gemini", "settings.json")], npxAgent: "gemini-cli" },
   { id: "hermes", executable: "hermes", skillDir: join(home, ".hermes", "skills"), mcpFiles: [join(home, ".hermes", "config.yaml")], npxAgent: "hermes-agent" },
   { id: "goose", executable: "goose", skillDir: join(home, ".config", "goose", "skills"), mcpFiles: [join(home, ".config", "goose", "config.yaml")], npxAgent: "goose" },
@@ -168,8 +194,13 @@ function fail(message: string): never {
 }
 
 function commandExists(command: string): boolean {
-  const result = Bun.spawnSync([platform() === "win32" ? "where" : "which", command], { stdout: "ignore", stderr: "ignore" });
-  return result.exitCode === 0;
+  const candidates = command.includes("/") ? [command] : (process.env.PATH ?? "").split(delimiter).filter(Boolean).flatMap((directory) => {
+    if (platform() !== "win32") return [join(directory, command)];
+    return (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").map((extension) => join(directory, `${command}${extension.toLowerCase()}`));
+  });
+  return candidates.some((candidate) => {
+    try { accessSync(candidate, constants.X_OK); return true; } catch { return false; }
+  });
 }
 
 function run(args: string[], options: { cwd?: string; quiet?: boolean } = {}): string {
@@ -343,7 +374,7 @@ export function embeddedSkillPaths(skillDir: string): string[] {
   const embedded: string[] = [];
   const visit = (path: string) => {
     for (const name of readdirSync(path).sort()) {
-      if (name === ".git" || name === "node_modules") continue;
+      if (name.startsWith(".") || name === "node_modules") continue;
       const child = join(path, name);
       let info;
       try { info = lstatSync(child); } catch { continue; }
@@ -421,6 +452,21 @@ export function inspectSkillDirectory(skillDir: string, canonicalDir = canonical
     }
   }
   return issues;
+}
+
+export function inspectHarnessSkillDirectory(
+  harness: Pick<Harness, "skillDir" | "nativeSkills" | "legacySkillDir">,
+  canonicalDir = canonicalSkills,
+): SkillIssue[] {
+  if (!harness.nativeSkills) return inspectSkillDirectory(harness.skillDir, canonicalDir);
+  const legacy = harness.legacySkillDir;
+  if (!legacy || !pathExists(legacy)) return [];
+  try {
+    if (lstatSync(legacy).isSymbolicLink() && realpathSync(legacy) === realpathSync(canonicalDir)) {
+      return [{ path: legacy, issue: "redundant-directory-link" }];
+    }
+  } catch { /* a broken legacy path is not part of native skill discovery */ }
+  return [];
 }
 
 export function discoverMarketplaceSkills(
@@ -651,6 +697,160 @@ function pathExists(path: string): boolean {
   try { lstatSync(path); return true; } catch { return false; }
 }
 
+function insidePath(path: string, parent: string): boolean {
+  const child = resolve(path);
+  const root = resolve(parent);
+  return child === root || child.startsWith(`${root}/`);
+}
+
+export function findSyncthingRoot(path: string, boundary = home): string | undefined {
+  let current = pathExists(path) && lstatSync(path).isDirectory() ? resolve(path) : dirname(resolve(path));
+  const limit = resolve(boundary);
+  while (insidePath(current, limit)) {
+    if (pathExists(join(current, ".stfolder"))) return current;
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  if (!commandExists("syncthing")) return undefined;
+  const listed = Bun.spawnSync(["syncthing", "cli", "config", "folders", "list"], { stdout: "pipe", stderr: "ignore" });
+  if (listed.exitCode !== 0) return undefined;
+  const roots = listed.stdout.toString().trim().split(/\s+/).flatMap((id) => {
+    if (!id) return [];
+    const result = Bun.spawnSync(["syncthing", "cli", "config", "folders", id, "path", "get"], { stdout: "pipe", stderr: "ignore" });
+    if (result.exitCode !== 0) return [];
+    const configured = result.stdout.toString().trim();
+    const expanded = configured === "~" ? limit : configured.startsWith("~/") ? join(limit, configured.slice(2)) : resolve(configured);
+    return insidePath(expanded, limit) ? [expanded] : [];
+  }).sort((left, right) => right.length - left.length);
+  return roots.find((root) => insidePath(path, root));
+}
+
+type HookCommand = { event: string; hook: number; command: string };
+
+function hookCommands(config: any): HookCommand[] {
+  if (!config || typeof config !== "object" || !config.hooks || typeof config.hooks !== "object") return [];
+  const commands: HookCommand[] = [];
+  for (const [event, registrations] of Object.entries(config.hooks)) {
+    if (!Array.isArray(registrations)) continue;
+    let hook = 0;
+    for (const registration of registrations) {
+      const entries = Array.isArray((registration as any)?.hooks) ? (registration as any).hooks : [];
+      for (const entry of entries) {
+        if (typeof entry?.command === "string") commands.push({ event, hook, command: entry.command });
+        hook++;
+      }
+    }
+  }
+  return commands;
+}
+
+function guardedHookCommand(command: string): boolean {
+  return /(?:command\s+-v|\btest\s+-[efx]\b|\[\[?\s+-[efx]\s|\|\|\s*(?:true|printf|exit\s+0)|\bif\s+\[)/.test(command);
+}
+
+export function inspectHookConfiguration(
+  path: string,
+  options: { shared?: boolean; userHome?: string; syncedRoot?: string } = {},
+): HookAuditIssue[] {
+  if (!pathExists(path)) return [];
+  let config: any;
+  try { config = readJson(path); } catch {
+    return [{ issue: "invalid-json", path, event: "config", hook: 0, field: "command" }];
+  }
+  const userHome = options.userHome ?? home;
+  const shared = options.shared ?? Boolean(options.syncedRoot ?? findSyncthingRoot(path, userHome));
+  const issues: HookAuditIssue[] = [];
+  for (const item of hookCommands(config)) {
+    if (shared && /\/(?:Users|home)\/[A-Za-z0-9._-]+\//.test(item.command)) {
+      issues.push({ issue: "absolute-home-path", path, event: item.event, hook: item.hook, field: "command" });
+    }
+    if (shared && /(?:^|[\s"'])(?:\/opt\/homebrew|\/usr\/local)\//.test(item.command)) {
+      issues.push({ issue: "machine-local-executable", path, event: item.event, hook: item.hook, field: "command" });
+    }
+    if (!guardedHookCommand(item.command)) {
+      const references = [...item.command.matchAll(/(?:\$\{HOME\}|\$HOME)(\/[A-Za-z0-9._@%+,:=~\/-]+)/g)];
+      for (const match of references) {
+        const suffix = match[1].replace(/[)'";]+$/, "");
+        if (suffix && !pathExists(join(userHome, suffix))) {
+          issues.push({ issue: "missing-target", path, event: item.event, hook: item.hook, field: "command" });
+          break;
+        }
+      }
+    }
+  }
+  return issues.sort((left, right) => `${left.path}:${left.event}:${left.hook}:${left.issue}`.localeCompare(`${right.path}:${right.event}:${right.hook}:${right.issue}`));
+}
+
+function homePortablePath(path: string, userHome = home): string {
+  const absolute = resolve(path);
+  return insidePath(absolute, userHome) ? `~/${relative(userHome, absolute)}` : absolute;
+}
+
+function resolvePortablePath(path: string, userHome = home): string {
+  return path === "~" ? userHome : path.startsWith("~/") ? join(userHome, path.slice(2)) : resolve(path);
+}
+
+function hashFile(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+export function readPortableConfigManifest(path = portableConfigManifestPath): PortableConfigManifest {
+  if (!existsSync(path)) return { version: 1, configs: {} };
+  const value = readJson(path);
+  if (value?.version !== 1 || !value.configs || typeof value.configs !== "object") throw new Error(`invalid portable config manifest: ${path}`);
+  return value;
+}
+
+function exactSyncthingIgnore(root: string, target: string): string {
+  return `/${relative(root, target).replaceAll("\\", "/")}`;
+}
+
+function targetIsIgnored(target: string, userHome = home): boolean {
+  const root = findSyncthingRoot(target, userHome);
+  if (!root) return true;
+  const ignore = join(root, ".stignore");
+  if (!existsSync(ignore)) return false;
+  const pattern = exactSyncthingIgnore(root, target);
+  return readFileSync(ignore, "utf8").split(/\r?\n/).map((line) => line.trim()).includes(pattern);
+}
+
+function ensureTargetIgnored(target: string, userHome = home): string | undefined {
+  const root = findSyncthingRoot(target, userHome);
+  if (!root) return undefined;
+  const ignore = join(root, ".stignore");
+  const pattern = exactSyncthingIgnore(root, target);
+  const current = existsSync(ignore) ? readFileSync(ignore, "utf8") : "";
+  if (!current.split(/\r?\n/).map((line) => line.trim()).includes(pattern)) {
+    const separator = current.length && !current.endsWith("\n") ? "\n" : "";
+    writeTextAtomic(ignore, `${current}${separator}\n// Rendered locally by harness-sync\n${pattern}\n`);
+  }
+  return ignore;
+}
+
+export function inspectPortableConfigs(
+  manifest: PortableConfigManifest,
+  options: { userHome?: string } = {},
+): PortableConfigIssue[] {
+  const userHome = options.userHome ?? home;
+  const issues: PortableConfigIssue[] = [];
+  for (const [id, entry] of Object.entries(manifest.configs)) {
+    const source = resolvePortablePath(entry.source, userHome);
+    const target = resolvePortablePath(entry.target, userHome);
+    if (!existsSync(source)) {
+      issues.push({ issue: "source-missing", id, path: source });
+      continue;
+    }
+    if (entry.format === "json" && inspectHookConfiguration(source, { shared: true, userHome }).length) {
+      issues.push({ issue: "source-non-portable", id, path: source });
+    }
+    if (!existsSync(target)) issues.push({ issue: "target-missing", id, path: target });
+    else if (hashFile(source) !== hashFile(target)) issues.push({ issue: "target-drift", id, path: target });
+    if (!targetIsIgnored(target, userHome)) issues.push({ issue: "target-not-ignored", id, path: target });
+  }
+  return issues.sort((left, right) => `${left.id}:${left.issue}`.localeCompare(`${right.id}:${right.issue}`));
+}
+
 function projectRoot(): string {
   if (!commandExists("git")) return cwd;
   const result = Bun.spawnSync(["git", "rev-parse", "--show-toplevel"], { cwd, stdout: "pipe", stderr: "ignore" });
@@ -734,6 +934,7 @@ function strictSkillIssueCode(issue: string, canonical: boolean): string | undef
     return `skill-${issue}`;
   }
   if (issue === "copy-drift") return "skill-copy-drift";
+  if (issue === "redundant-directory-link") return "skill-redundant-directory-link";
   if (issue === "copy" || issue === "untracked-copy") return undefined;
   return canonical || issue.includes("SKILL.md") || issue.includes("frontmatter") || issue.startsWith("name-mismatch:")
     ? canonical ? "canonical-invalid-metadata" : "skill-invalid-metadata"
@@ -762,6 +963,8 @@ function classifyStrictAudit(
   mcpIssues: McpAuditIssue[],
   mcpManifest: McpManifest,
   instructions: InstructionsStatus[],
+  hookIssues: HookAuditIssue[],
+  portableConfigIssues: PortableConfigIssue[],
 ): StrictAuditSummary {
   const findings: StrictAuditFinding[] = [];
   if (!canonicalExists && !canonicalIssues.some((item) => item.issue === "missing-directory")) {
@@ -786,6 +989,12 @@ function classifyStrictAudit(
     else if (item.status === "wrong-link") findings.push({ code: "instructions-wrong-link", path: item.claude });
     else if (item.status === "conflict") findings.push({ code: "instructions-conflict", path: item.claude });
   }
+  for (const item of hookIssues) {
+    findings.push({ code: `hook-${item.issue}`, path: item.path, field: item.field, event: item.event, hook: item.hook });
+  }
+  for (const item of portableConfigIssues) {
+    findings.push({ code: `portable-config-${item.issue}`, path: item.path, id: item.id });
+  }
   return { actionable: findings.length > 0, findings };
 }
 
@@ -795,7 +1004,12 @@ function redactMcpAuditIssues(issues: McpAuditIssue[]): McpAuditIssue[] {
 
 function audit(asJson: boolean, strict = false): void {
   const canonicalIssues = inspectCanonicalSkillDirectory(canonicalSkills);
-  const skills = detectedHarnesses().map(({ id, installed, skillDir }) => ({ id, installed, skillDir, issues: inspectSkillDirectory(skillDir) }));
+  const skills = detectedHarnesses().map((harness) => ({
+    id: harness.id,
+    installed: harness.installed,
+    skillDir: harness.skillDir,
+    issues: inspectHarnessSkillDirectory(harness),
+  }));
   const marketplaceSkills = discoverMarketplaceSkills();
   const mcp = harnesses.flatMap((harness) => harness.mcpFiles.filter(existsSync).map((path) => ({ harness: harness.id, path, servers: mcpInventory(path) })));
   const mcpManifest = scanMcpManifest(mcpSources(), readMcpManifest());
@@ -809,9 +1023,14 @@ function audit(asJson: boolean, strict = false): void {
     conflicts: Object.entries(mcpManifest.servers).filter(([, item]) => item.conflict).map(([name]) => name),
   };
   const instructions = instructionTargets("all");
-  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, mcpIssues, instructions };
+  const hookFiles = [join(home, ".claude", "settings.json"), join(home, ".codex", "hooks.json")].filter(pathExists);
+  const hookIssues = hookFiles.flatMap((path) => inspectHookConfiguration(path));
+  const portableConfigManifest = readPortableConfigManifest();
+  const portableConfigIssues = inspectPortableConfigs(portableConfigManifest);
+  const portableConfigs = { path: portableConfigManifestPath, exists: existsSync(portableConfigManifestPath), configs: Object.keys(portableConfigManifest.configs).sort(), issues: portableConfigIssues };
+  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, mcpIssues, instructions, hookIssues, portableConfigs };
   const strictSummary = strict
-    ? classifyStrictAudit(result.canonicalExists, canonicalIssues, skills, mcpIssues, mcpManifest, instructions)
+    ? classifyStrictAudit(result.canonicalExists, canonicalIssues, skills, mcpIssues, mcpManifest, instructions, hookIssues, portableConfigIssues)
     : undefined;
   const output = strict ? { ...result, strict: strictSummary } : result;
   if (asJson) console.log(JSON.stringify(output, null, 2));
@@ -837,6 +1056,8 @@ function audit(asJson: boolean, strict = false): void {
       }
     }
     for (const item of instructions) console.log(`instructions ${item.root}: ${item.status}`);
+    for (const item of hookIssues) console.log(`hook portability: ${item.path}: ${item.event}[${item.hook}] ${item.issue}`);
+    console.log(`portable configs: ${portableConfigs.exists ? portableConfigs.configs.length : "not initialized"}; issues=${portableConfigIssues.length}`);
     if (strictSummary) console.log(`Strict audit: ${strictSummary.actionable ? `${strictSummary.findings.length} actionable finding(s)` : "clean"}`);
   }
   if (strict) process.exitCode = strictSummary?.actionable ? 1 : 0;
@@ -880,6 +1101,155 @@ function applyRequired(args: string[]): boolean {
   const apply = args.includes("--apply");
   if (apply && !args.includes("--confirmed")) fail("--apply requires --confirmed after explicit user confirmation");
   return apply;
+}
+
+function argumentValue(args: string[], flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
+function portableConfigRegister(args: string[]): void {
+  const apply = applyRequired(args);
+  const id = argumentValue(args, "--id");
+  const sourceValue = argumentValue(args, "--source");
+  const targetValue = argumentValue(args, "--target");
+  const seedValue = argumentValue(args, "--seed-from");
+  const format = (argumentValue(args, "--format") ?? "json") as "json" | "text";
+  if (!id || !/^[a-z0-9][a-z0-9-]*$/.test(id)) fail("portable-config register requires --id <lowercase-name>");
+  if (!sourceValue || !targetValue) fail("portable-config register requires --source and --target");
+  if (!['json', 'text'].includes(format)) fail("--format must be json or text");
+  const source = resolvePortablePath(sourceValue);
+  const target = resolvePortablePath(targetValue);
+  const seed = resolvePortablePath(seedValue ?? targetValue);
+  if (source === target) fail("portable source and rendered target must be different paths");
+  if (!existsSync(seed) && !existsSync(source)) fail(`portable source seed is missing: ${seed}`);
+  const candidate = existsSync(source) ? source : seed;
+  if (format === "json") {
+    try { readJson(candidate); } catch { fail(`portable source is not valid JSON: ${candidate}`); }
+    const hookIssues = inspectHookConfiguration(candidate, { shared: true });
+    if (hookIssues.length) fail(`portable source has ${hookIssues.length} hook portability issue(s)`);
+  }
+  const manifest = readPortableConfigManifest();
+  const entry: PortableConfigEntry = {
+    source: homePortablePath(source),
+    target: homePortablePath(target),
+    format,
+    mode: "0600",
+  };
+  const sourceWillChange = !existsSync(source) || existsSync(seed) && hashFile(source) !== hashFile(seed);
+  const plan = {
+    action: "portable-config-register",
+    apply: false,
+    id,
+    source: entry.source,
+    target: entry.target,
+    seed: homePortablePath(seed),
+    sourceWillChange,
+    targetIgnoreRequired: !targetIsIgnored(target),
+    writes: [],
+  };
+  console.log(JSON.stringify(plan, null, 2));
+  if (!apply) return;
+  if (existsSync(source) && sourceWillChange && !args.includes("--replace-source")) fail(`portable source exists with different content; review and pass --replace-source: ${source}`);
+  const syncedRoot = findSyncthingRoot(target);
+  const ignore = syncedRoot ? join(syncedRoot, ".stignore") : undefined;
+  const backupRoot = backup([portableConfigManifestPath, source, ...(ignore ? [ignore] : [])]);
+  try {
+    if (sourceWillChange) {
+      mkdirSync(dirname(source), { recursive: true });
+      cpSync(seed, source);
+      chmodSync(source, 0o600);
+    }
+    manifest.configs[id] = entry;
+    writeJsonAtomic(portableConfigManifestPath, manifest);
+    ensureTargetIgnored(target);
+    cleanOldBackups();
+    console.log(`Registered portable config ${id}. Manifest: ${portableConfigManifestPath}. Backup: ${backupRoot}`);
+  } catch (error) {
+    restoreBackup(backupRoot);
+    throw new Error(`portable config registration failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
+  }
+}
+
+function portableConfigRender(args: string[]): void {
+  const apply = applyRequired(args);
+  const selected = argumentValue(args, "--id");
+  const manifest = readPortableConfigManifest();
+  const entries = Object.entries(manifest.configs).filter(([id]) => !selected || id === selected);
+  if (selected && !entries.length) fail(`portable config is not registered: ${selected}`);
+  if (!entries.length) fail("no portable configs are registered");
+  const operations = entries.map(([id, entry]) => {
+    const source = resolvePortablePath(entry.source);
+    const target = resolvePortablePath(entry.target);
+    if (!existsSync(source)) fail(`portable source is missing: ${source}`);
+    if (entry.format === "json") {
+      try { readJson(source); } catch { fail(`portable source is not valid JSON: ${source}`); }
+      const issues = inspectHookConfiguration(source, { shared: true });
+      if (issues.length) fail(`portable source ${id} has ${issues.length} hook portability issue(s)`);
+    }
+    return { id, source, target, changed: !existsSync(target) || hashFile(source) !== hashFile(target), ignoreRequired: !targetIsIgnored(target) };
+  });
+  console.log(JSON.stringify({
+    action: "portable-config-render",
+    apply: false,
+    operations: operations.map((item) => ({ id: item.id, source: homePortablePath(item.source), target: homePortablePath(item.target), changed: item.changed, ignoreRequired: item.ignoreRequired })),
+    writes: [],
+  }, null, 2));
+  if (!apply) return;
+  const affected = operations.flatMap((item) => {
+    const root = findSyncthingRoot(item.target);
+    return [item.target, ...(root ? [join(root, ".stignore")] : [])];
+  });
+  const backupRoot = backup(affected);
+  try {
+    for (const item of operations) {
+      ensureTargetIgnored(item.target);
+      if (item.changed) {
+        mkdirSync(dirname(item.target), { recursive: true });
+        cpSync(item.source, item.target);
+      }
+      chmodSync(item.target, 0o600);
+    }
+    const remaining = inspectPortableConfigs(manifest);
+    if (remaining.length) throw new Error(`render left ${remaining.length} portable config issue(s)`);
+    cleanOldBackups();
+    console.log(`Rendered ${operations.length} portable config(s). Backup: ${backupRoot}`);
+  } catch (error) {
+    restoreBackup(backupRoot);
+    throw new Error(`portable config render failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
+  }
+}
+
+function portableConfigCommand(args: string[]): void {
+  const [action, ...rest] = args;
+  if (action === "register") return portableConfigRegister(rest);
+  if (action === "render") return portableConfigRender(rest);
+  fail("portable-config requires register or render");
+}
+
+function doctor(asJson: boolean, strict: boolean): void {
+  const hookFiles = [join(home, ".claude", "settings.json"), join(home, ".codex", "hooks.json")].filter(pathExists);
+  const hookIssues = hookFiles.flatMap((path) => inspectHookConfiguration(path));
+  const manifest = readPortableConfigManifest();
+  const portableConfigs = inspectPortableConfigs(manifest);
+  const report = {
+    version: 1,
+    host: hostname(),
+    platform: platform(),
+    arch: arch(),
+    harnesses: detectedHarnesses().map((item) => ({ id: item.id, installed: item.installed })),
+    hooks: { files: hookFiles.map((path) => homePortablePath(path)), issues: hookIssues },
+    portableConfigs: { manifest: homePortablePath(portableConfigManifestPath), registered: Object.keys(manifest.configs).sort(), issues: portableConfigs },
+    actionable: hookIssues.length + portableConfigs.length > 0,
+  };
+  if (asJson) console.log(JSON.stringify(report, null, 2));
+  else {
+    console.log(`${report.host}: ${report.platform}/${report.arch}`);
+    for (const item of report.harnesses) console.log(`${item.id}: ${item.installed ? "installed" : "config-only"}`);
+    console.log(`hook issues: ${hookIssues.length}`);
+    console.log(`portable config issues: ${portableConfigs.length}`);
+  }
+  if (strict) process.exitCode = report.actionable ? 1 : 0;
 }
 
 function addSkill(args: string[]): void {
@@ -1750,10 +2120,14 @@ function mcpRemove(args: string[]): void {
 }
 
 function usage(): void {
-  console.log(`harness-sync [audit|init|instructions|add|remove|update|mcp|mcp-remove]
+  console.log(`harness-sync [audit|doctor|portable-config|init|instructions|add|remove|update|mcp|mcp-remove]
 
 Commands:
   audit [--strict] [--json]
+  doctor [--strict] [--json]
+  portable-config register --id <name> --source <portable-file> --target <rendered-file>
+      [--seed-from <existing-file>] [--format json|text] [--replace-source]
+  portable-config render [--id <name>]
   init
   instructions [--scope project|user|all] [--replace]
   add <source|npx skills add ...> [--skill <name>...] [--full-depth]
@@ -1778,6 +2152,8 @@ export function main(argv = process.argv.slice(2)): void {
   try {
     if (!command || command === "--help" || command === "-h") return usage();
     if (command === "audit") return audit(args.includes("--json"), args.includes("--strict"));
+    if (command === "doctor") return doctor(args.includes("--json"), args.includes("--strict"));
+    if (command === "portable-config") return portableConfigCommand(args);
     if (command === "init") return initState(args);
     if (command === "instructions") return syncInstructions(args);
     if (command === "add") return addSkill(args);

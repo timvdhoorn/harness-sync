@@ -19,8 +19,21 @@ specific home directory.
 - Skill source, version, and content provenance
 - Shared `AGENTS.md` and `CLAUDE.md` instruction files
 - MCP definitions and provenance across supported harnesses
+- Portable source files rendered into machine-local synchronized config targets
+- Secret-free host reports for Linux/macOS comparison
 - Marketplace skill discovery without bulk copying plugin contents
 - Backups and automatic recovery when an apply fails
+
+OpenCode reads the canonical `.agents` directory directly. Harness Sync does not
+create a second `~/.config/opencode/skills` adapter, because current OpenCode
+versions would load every skill twice.
+
+For settings shared through Syncthing, keep the portable source outside the
+generated target directory. `portable-config register` records the mapping and
+adds the rendered target to that Syncthing root's exact ignore list;
+`portable-config render` validates and writes the local target atomically.
+`audit --strict` rejects synchronized hooks with Linux/macOS home literals,
+machine-local executable paths, or unguarded missing home-relative helpers.
 
 Harness Sync compares MCP definitions by behavior, not just by server name. The
 comparison includes transport, command, arguments, working directory, URL,
@@ -118,6 +131,29 @@ Unknown provenance and absent optional harnesses remain informational. It checks
 the complete current inventory, including user-level configuration; it has no
 scope filter. The default audit remains informational, and `bun run check` keeps
 that default so unrelated machine drift does not fail the repository's checks.
+
+Create a portable source for a settings file that currently lives inside a
+Syncthing root:
+
+```bash
+bun run scripts/harness-sync.ts portable-config register \
+  --id claude-settings \
+  --source ~/.agents/harness-sync/claude-settings.json \
+  --target ~/.claude/settings.json \
+  --seed-from ~/.claude/settings.json
+```
+
+Review the JSON plan, then repeat with `--apply --confirmed`. On every receiving
+machine, preview and apply the local render:
+
+```bash
+bun run scripts/harness-sync.ts portable-config render --id claude-settings
+bun run scripts/harness-sync.ts portable-config render --id claude-settings --apply --confirmed
+bun run scripts/harness-sync.ts doctor --strict --json
+```
+
+The source and manifest may be synchronized. The generated target is ignored by
+its enclosing Syncthing folder and remains machine-local.
 
 Preview the provenance records that `init` would create for the skills and MCP
 servers already installed:
