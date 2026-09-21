@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -20,11 +20,14 @@ function fixture(): string {
 }
 
 function runAudit(root: string, ...args: string[]) {
+  return runCli(root, "audit", ...args);
+}
+
+function runCli(root: string, ...args: string[]) {
   return Bun.spawnSync([
     process.execPath,
     "run",
     join(import.meta.dir, "..", "scripts", "harness-sync.ts"),
-    "audit",
     ...args,
   ], {
     cwd: join(root, "project"),
@@ -151,6 +154,52 @@ describe("strict audit CLI", () => {
       code: "skill-redundant-directory-link",
       path: join(root, ".config", "opencode", "skills"),
     });
+  });
+
+  test("fails on a macOS home path in synchronized hook settings without exposing the command", () => {
+    const root = fixture();
+    mkdirSync(join(root, ".claude", ".stfolder"), { recursive: true });
+    write(root, ".claude/settings.json", JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ command: "sh '/Users/alice/.claude/hooks/start.sh' --private-value" }] }] } }));
+    const { result, audit } = auditJson(root);
+    expect(result.exitCode).toBe(1);
+    expect(audit.strict.findings).toContainEqual({
+      code: "hook-absolute-home-path",
+      path: join(root, ".claude/settings.json"),
+      field: "command",
+      event: "SessionStart",
+      hook: 0,
+    });
+    expect(result.stdout.toString()).not.toContain("private-value");
+  });
+
+  test("registers and renders a portable config without syncing the generated target", () => {
+    const root = fixture();
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    const syncthing = join(root, "bin", "syncthing");
+    writeFileSync(syncthing, `#!/bin/sh
+case "$*" in
+  "cli config folders list") printf 'claude\\n' ;;
+  "cli config folders claude path get") printf '~/.claude\\n' ;;
+  *) exit 1 ;;
+esac
+`);
+    chmodSync(syncthing, 0o755);
+    const target = join(root, ".claude", "settings.json");
+    const source = join(root, ".agents", "harness-sync", "claude-settings.json");
+    writeFileSync(target, JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: "if [ -x \"${HOME}/.claude/hooks/optional.sh\" ]; then exec \"${HOME}/.claude/hooks/optional.sh\"; else printf '{}\\n'; fi" }] }] } }));
+    const registerArgs = ["portable-config", "register", "--id", "claude-settings", "--source", source, "--target", target, "--seed-from", target];
+    const before = snapshot(root);
+    expect(runCli(root, ...registerArgs).exitCode).toBe(0);
+    expect(snapshot(root)).toBe(before);
+    expect(runCli(root, ...registerArgs, "--apply", "--confirmed").exitCode).toBe(0);
+    expect(readFileSync(source, "utf8")).toBe(readFileSync(target, "utf8"));
+    expect(readFileSync(join(root, ".claude", ".stignore"), "utf8")).toContain("/settings.json");
+    writeFileSync(target, "{}\n");
+    expect(runCli(root, "portable-config", "render", "--id", "claude-settings").exitCode).toBe(0);
+    expect(readFileSync(target, "utf8")).toBe("{}\n");
+    expect(runCli(root, "portable-config", "render", "--id", "claude-settings", "--apply", "--confirmed").exitCode).toBe(0);
+    expect(readFileSync(target, "utf8")).toBe(readFileSync(source, "utf8"));
+    expect(runCli(root, "doctor", "--strict", "--json").exitCode).toBe(0);
   });
 
   test.each(["missing", "conflict", "wrong-link"])("fails on a %s Claude entrypoint when canonical instructions exist", (state) => {

@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, embeddedSkillPaths, harnesses, inferMcpScope, inferMcpUpstream, inspectCanonicalSkillDirectory, inspectHarnessSkillDirectory, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, skillInstallSource, sourceForMcp, validSkillName } from "../scripts/harness-sync";
+import { dirname, join } from "node:path";
+import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, embeddedSkillPaths, findSyncthingRoot, harnesses, inferMcpScope, inferMcpUpstream, inspectCanonicalSkillDirectory, inspectHarnessSkillDirectory, inspectHookConfiguration, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectPortableConfigs, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, skillInstallSource, sourceForMcp, validSkillName } from "../scripts/harness-sync";
 
 const temporary: string[] = [];
 
@@ -1076,6 +1076,61 @@ describe("instruction files", () => {
   });
 });
 
+describe("portable shared configuration", () => {
+  test("finds Syncthing roots and rejects Linux, macOS, and machine-local hook paths", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const shared = join(root, ".claude");
+    mkdirSync(join(shared, ".stfolder"), { recursive: true });
+    const settings = join(shared, "settings.json");
+    writeFileSync(settings, JSON.stringify({ hooks: { SessionStart: [{ hooks: [
+      { command: "sh '/Users/alice/.claude/hooks/start.sh'" },
+      { command: "sh '/home/alice/.claude/hooks/start.sh'" },
+      { command: "'/opt/homebrew/bin/helper' run" },
+    ] }] } }));
+    expect(findSyncthingRoot(settings, root)).toBe(shared);
+    expect(inspectHookConfiguration(settings, { userHome: root }).map((item) => item.issue)).toEqual([
+      "absolute-home-path",
+      "absolute-home-path",
+      "machine-local-executable",
+    ]);
+  });
+
+  test("accepts a guarded home-relative helper and rejects an unguarded missing target", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const guarded = join(root, "guarded.json");
+    writeFileSync(guarded, JSON.stringify({ hooks: { Stop: [{ hooks: [
+      { command: "if [ -x \"${HOME}/.claude/hooks/optional.sh\" ]; then exec \"${HOME}/.claude/hooks/optional.sh\"; else printf '{}\\n'; fi" },
+      { command: "sh \"${HOME}/.claude/hooks/required.sh\"" },
+    ] }] } }));
+    expect(inspectHookConfiguration(guarded, { shared: true, userHome: root })).toEqual([{
+      issue: "missing-target",
+      path: guarded,
+      event: "Stop",
+      hook: 1,
+      field: "command",
+    }]);
+  });
+
+  test("audits rendered config drift and the exact Syncthing ignore", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const source = join(root, ".agents", "harness-sync", "claude-settings.json");
+    const target = join(root, ".claude", "settings.json");
+    mkdirSync(dirname(source), { recursive: true });
+    mkdirSync(join(root, ".claude", ".stfolder"), { recursive: true });
+    const content = JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: "if [ -x \"${HOME}/.claude/hooks/optional.sh\" ]; then exec \"${HOME}/.claude/hooks/optional.sh\"; else printf '{}\\n'; fi" }] }] } });
+    writeFileSync(source, content);
+    writeFileSync(target, content);
+    writeFileSync(join(root, ".claude", ".stignore"), "/settings.json\n");
+    const manifest = { version: 1 as const, configs: { claude: { source: "~/.agents/harness-sync/claude-settings.json", target: "~/.claude/settings.json", format: "json" as const, mode: "0600" as const } } };
+    expect(inspectPortableConfigs(manifest, { userHome: root })).toEqual([]);
+    writeFileSync(target, "{}\n");
+    expect(inspectPortableConfigs(manifest, { userHome: root })).toContainEqual({ issue: "target-drift", id: "claude", path: target });
+  });
+});
+
 describe("CLI", () => {
   test("prints help successfully", () => {
     const result = Bun.spawnSync(["bun", "run", join(import.meta.dir, "..", "scripts", "harness-sync.ts"), "--help"], {
@@ -1083,7 +1138,7 @@ describe("CLI", () => {
       stderr: "pipe",
     });
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.toString()).toContain("harness-sync [audit|init|instructions|add|remove|update|mcp|mcp-remove]");
+    expect(result.stdout.toString()).toContain("harness-sync [audit|doctor|portable-config|init|instructions|add|remove|update|mcp|mcp-remove]");
     expect(result.stderr.toString()).toBe("");
   });
 });

@@ -35,6 +35,14 @@ Keep machine-local binaries out of shared hook settings. When an optional helper
 
 After a hook change, validate the settings syntax, confirm that the removed command and foreign home literals are absent, then start each affected harness from an unrelated directory on every named machine and submit a harmless prompt. A successful config parse or file sync is not evidence that the harness accepted a turn. If a named machine is unavailable, report that verification gap instead of claiming cross-machine completion.
 
+## Portable configuration
+
+Treat a synchronized source and a harness-owned target as separate artifacts. Register the source and target with `portable-config register`; seed a new source from a reviewed existing target only after its hook portability check passes. The manifest stores home-relative `~/` locations and contains no config values. Registration adds the generated target as an exact root-relative entry in the enclosing Syncthing `.stignore`.
+
+Render with `portable-config render`. Rendering validates JSON and shared hooks, backs up the target and ignore file, copies without interpolating `~` or `${HOME}`, writes mode `0600`, and rolls back on any remaining source, drift, or ignore finding. This preserves format-specific expansion: shell hook commands may expand `${HOME}`, symlink targets remain relative, executables resolve through `PATH`, and formats without expansion receive a machine-local rendered value.
+
+Run `doctor --strict --json` on each named host. Compare host, platform, architecture, installed harnesses, hook findings and portable-config findings; the report omits config values and commands. Zero findings proves local rendering and portability, not runtime loading. Follow with the Shared hook configuration prompt check. An unreachable host remains an explicit verification gap.
+
 ## Instruction files
 
 Use a relative `CLAUDE.md` link for shared-only instructions. When Claude-specific imports or rules are needed, preserve a real wrapper importing the canonical `AGENTS.md`. The inspector recognizes a direct standalone import outside code fences that resolves to the canonical file; it does not execute or recursively expand imports. Unrecognized real files remain conflicts requiring reviewed replacement and backup. If `AGENTS.md` points to `CLAUDE.md`, preserve a real canonical file before changing links.
