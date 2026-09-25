@@ -1452,24 +1452,90 @@ function codexServerBlock(name: string, server: McpServer, unknownRoot: string[]
   return text;
 }
 
+type TomlSection = { header?: string; arrayTable: boolean; statements: string[] };
+
+function tomlLineState(line: string, state: { depth: number; triple?: string }): { depth: number; triple?: string } {
+  let { depth, triple } = state;
+  let index = 0;
+  while (index < line.length) {
+    if (triple) {
+      const end = line.indexOf(triple, index);
+      if (end < 0) return { depth, triple };
+      index = end + 3;
+      triple = undefined;
+      continue;
+    }
+    const char = line[index];
+    if (char === "#") break;
+    if (line.startsWith('"""', index) || line.startsWith("'''", index)) {
+      triple = line.slice(index, index + 3);
+      index += 3;
+    } else if (char === '"') {
+      index++;
+      while (index < line.length && line[index] !== '"') index += line[index] === "\\" ? 2 : 1;
+      index++;
+    } else if (char === "'") {
+      const end = line.indexOf("'", index + 1);
+      index = end < 0 ? line.length : end + 1;
+    } else {
+      if (char === "[" || char === "{") depth++;
+      if (char === "]" || char === "}") depth--;
+      index++;
+    }
+  }
+  return { depth, triple };
+}
+
+function tomlStatements(text: string): string[] {
+  const statements: string[] = [];
+  let current: string[] = [];
+  let state: { depth: number; triple?: string } = { depth: 0 };
+  for (const line of text.split("\n")) {
+    current.push(line);
+    state = tomlLineState(line, state);
+    if (state.depth <= 0 && !state.triple) {
+      statements.push(current.join("\n"));
+      current = [];
+      state = { depth: 0 };
+    }
+  }
+  if (current.length) statements.push(current.join("\n"));
+  return statements;
+}
+
+function tomlSections(text: string): TomlSection[] {
+  const sections: TomlSection[] = [{ arrayTable: false, statements: [] }];
+  for (const statement of tomlStatements(text.trimEnd())) {
+    const header = statement.includes("\n") ? undefined : statement.trim().match(/^(\[\[?)\s*([^\[\]]+?)\s*\]\]?\s*(?:#.*)?$/);
+    if (header) sections.push({ header: header[2], arrayTable: header[1] === "[[", statements: [statement] });
+    else sections.at(-1)!.statements.push(statement);
+  }
+  return sections;
+}
+
+function tomlSectionText(section: TomlSection): string {
+  return section.statements.join("\n").trim();
+}
+
+function codexSectionServer(section: TomlSection): { server: string; field?: string } | undefined {
+  return section.header && !section.arrayTable ? codexSection(section.header) : undefined;
+}
+
 function updateCodexServer(text: string, name: string, server: McpServer): string {
-  const sections = text.trimEnd().split(/(?=^\s*\[[^\]]+\]\s*$)/m);
   const kept: string[] = [];
   const unknownRoot: string[] = [];
-  for (const section of sections) {
-    const lines = section.trim().split("\n");
-    const header = lines[0]?.trim().match(/^\[([^\]]+)\]$/)?.[1];
-    const parsed = header ? codexSection(header) : undefined;
+  for (const section of tomlSections(text)) {
+    const parsed = codexSectionServer(section);
     if (parsed?.server !== name) {
-      if (section.trim()) kept.push(section.trim());
+      if (tomlSectionText(section)) kept.push(tomlSectionText(section));
       continue;
     }
     if (parsed.field === "env" || parsed.field === "http_headers") continue;
     if (!parsed.field) {
-      unknownRoot.push(...lines.slice(1).filter((line) => !/^\s*(?:command|args|cwd|url|enabled)\s*=/.test(line)));
+      unknownRoot.push(...section.statements.slice(1).filter((statement) => statement.trim() && !/^\s*(?:command|args|cwd|url|enabled|env|http_headers)\s*=/.test(statement)));
       continue;
     }
-    kept.push(section.trim());
+    kept.push(tomlSectionText(section));
   }
   kept.push(codexServerBlock(name, server, unknownRoot));
   return `${kept.filter(Boolean).join("\n\n")}\n`;
@@ -1482,14 +1548,11 @@ function renderCodex(path: string, servers: Record<string, McpServer>): void {
 }
 
 function removeCodexServers(path: string, names: Set<string>): void {
-  const text = readFileSync(path, "utf8");
-  const sections = text.trimEnd().split(/(?=^\s*\[[^\]]+\]\s*$)/m);
-  const kept = sections.filter((section) => {
-    const header = section.trim().split("\n")[0]?.trim().match(/^\[([^\]]+)\]$/)?.[1];
-    const parsed = header ? codexSection(header) : undefined;
+  const kept = tomlSections(readFileSync(path, "utf8")).filter((section) => {
+    const parsed = codexSectionServer(section);
     return !parsed || !names.has(parsed.server);
   });
-  writeTextAtomic(path, `${kept.map((section) => section.trim()).filter(Boolean).join("\n\n")}\n`);
+  writeTextAtomic(path, `${kept.map(tomlSectionText).filter(Boolean).join("\n\n")}\n`);
 }
 
 function preserveUnknown(existing: unknown, known: string[]): Record<string, unknown> {
@@ -1544,16 +1607,76 @@ function renderYamlTarget(path: string, harness: "hermes" | "goose", servers: Re
   writeTextAtomic(path, Bun.YAML.stringify(yaml));
 }
 
+function parseDirectTarget(harness: string, path: string): any {
+  const text = readFileSync(path, "utf8");
+  if (harness === "codex") return Bun.TOML.parse(text);
+  if (harness === "hermes" || harness === "goose") return Bun.YAML.parse(text) ?? {};
+  return path.endsWith(".jsonc") ? Bun.JSONC.parse(text) : JSON.parse(text);
+}
+
+function directServerContainer(harness: string, document: any): Record<string, unknown> | undefined {
+  const object = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  if (harness === "codex" || harness === "hermes") return object(document?.mcp_servers);
+  if (harness === "goose") return object(document?.extensions);
+  if (harness === "opencode") return object(document?.mcp?.servers) ?? object(document?.mcp);
+  return object(document?.mcpServers) ?? object(document?.mcp?.servers) ?? object(document?.mcp);
+}
+
+function withoutServers(harness: string, document: any, names: string[]): string {
+  const copy = structuredClone(document ?? {});
+  const container = directServerContainer(harness, copy);
+  if (container) for (const name of names) delete container[name];
+  const prune = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(prune);
+    if (!value || typeof value !== "object") return value;
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, prune(item)] as const)
+      .filter(([, item]) => !(item && typeof item === "object" && !Array.isArray(item) && !Object.keys(item).length))
+      .sort(([left], [right]) => left.localeCompare(right));
+    return Object.fromEntries(entries);
+  };
+  return JSON.stringify(prune(copy));
+}
+
+function verifiedDirectWrite(harness: string, path: string, names: string[], present: boolean, write: () => void): void {
+  const original = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+  const before = original === undefined ? undefined : parseDirectTarget(harness, path);
+  write();
+  try {
+    let after: any;
+    try {
+      after = parseDirectTarget(harness, path);
+    } catch (error) {
+      throw new Error(`rendered ${harness} config is not valid: ${(error as Error).message}`);
+    }
+    const container = directServerContainer(harness, after) ?? {};
+    const wrong = names.filter((name) => (name in container) !== present);
+    if (wrong.length) throw new Error(`rendered ${harness} config has unexpected server state: ${wrong.join(", ")}`);
+    if (before !== undefined && withoutServers(harness, before, names) !== withoutServers(harness, after, names)) {
+      throw new Error(`rendered ${harness} config changed settings outside the selected servers`);
+    }
+  } catch (error) {
+    if (original === undefined) rmSync(writeDestination(path), { force: true });
+    else writeTextAtomic(path, original);
+    throw new Error(`${(error as Error).message}; ${path} left unchanged`);
+  }
+}
+
 export function renderDirectTarget(harness: string, path: string, servers: Record<string, McpServer>): void {
-  if (harness === "codex") return renderCodex(path, servers);
-  if (harness === "pi" || harness === "catalog") return renderPi(path, servers);
-  if (harness === "opencode") return renderOpenCode(path, servers);
-  if (harness === "hermes" || harness === "goose") return renderYamlTarget(path, harness, servers);
+  const names = Object.keys(servers);
+  if (harness === "codex") return verifiedDirectWrite(harness, path, names, true, () => renderCodex(path, servers));
+  if (harness === "pi" || harness === "catalog") return verifiedDirectWrite(harness, path, names, true, () => renderPi(path, servers));
+  if (harness === "opencode") return verifiedDirectWrite(harness, path, names, true, () => renderOpenCode(path, servers));
+  if (harness === "hermes" || harness === "goose") return verifiedDirectWrite(harness, path, names, true, () => renderYamlTarget(path, harness, servers));
   fail(`no direct MCP renderer for ${harness}`);
 }
 
 export function removeDirectMcpServers(harness: string, path: string, serverNames: string[]): void {
   if (!existsSync(path)) return;
+  verifiedDirectWrite(harness, path, serverNames, false, () => removeDirectMcpServersUnchecked(harness, path, serverNames));
+}
+
+function removeDirectMcpServersUnchecked(harness: string, path: string, serverNames: string[]): void {
   const names = new Set(serverNames);
   if (harness === "codex") return removeCodexServers(path, names);
   if (harness === "pi" || harness === "catalog") {

@@ -508,6 +508,42 @@ describe("MCP normalization", () => {
     }
   });
 
+  test("replaces multi-line Codex values without leaving fragments", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const path = join(root, "config.toml");
+    writeFileSync(path, 'model = "gpt"\n\n[mcp_servers.foo]\ncommand = "npx"\nargs = [\n  "-y",\n  "pkg",\n]\nenv = { A = "1" }\nstartup_timeout_sec = 20\n\n[[skills.config]]\npath = "/p"\n');
+    renderDirectTarget("codex", path, { foo: { command: "npx", args: ["-y", "pkg2"] } });
+    const parsed: any = Bun.TOML.parse(readFileSync(path, "utf8"));
+    expect(parsed.mcp_servers.foo.args).toEqual(["-y", "pkg2"]);
+    expect(parsed.mcp_servers.foo.startup_timeout_sec).toBe(20);
+    expect(parsed.mcp_servers.foo.env).toBeUndefined();
+    expect(parsed.skills.config).toEqual([{ path: "/p" }]);
+    expect(parsed.model).toBe("gpt");
+  });
+
+  test("removes Codex servers without touching array tables or commented headers", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const path = join(root, "config.toml");
+    writeFileSync(path, '[mcp_servers.foo]\ncommand = "x"\n\n[[skills.config]]\npath = "/p"\n\n[mcp_servers.bar] # keep\ncommand = "y"\n');
+    removeDirectMcpServers("codex", path, ["foo"]);
+    const parsed: any = Bun.TOML.parse(readFileSync(path, "utf8"));
+    expect(parsed.mcp_servers.foo).toBeUndefined();
+    expect(parsed.mcp_servers.bar.command).toBe("y");
+    expect(parsed.skills.config).toEqual([{ path: "/p" }]);
+  });
+
+  test("leaves a Codex config unchanged when a rewrite would lose unrelated settings", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const path = join(root, "config.toml");
+    const original = '[mcp_servers."a]b"]\ncommand = "x"\n\n[mcp_servers.keep]\ncommand = "y"\n';
+    writeFileSync(path, original);
+    expect(() => removeDirectMcpServers("codex", path, ["a]b"])).toThrow("left unchanged");
+    expect(readFileSync(path, "utf8")).toBe(original);
+  });
+
   test("writes through a symlinked target config instead of replacing the link", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);
