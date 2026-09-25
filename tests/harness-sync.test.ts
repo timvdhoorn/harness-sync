@@ -1010,6 +1010,27 @@ describe("MCP provenance", () => {
     expect(inspectMcpConfigurations(sources, "linux")).toContainEqual(expect.objectContaining({ issue: "missing-pi-server", harness: "grok", server: "typo" }));
   });
 
+  test("resolves launcher bindings, including Pi's, against the shared global catalog", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const catalog = join(root, "catalog.json");
+    const pi = join(root, "pi.json");
+    const claude = join(root, "claude.json");
+    writeFileSync(catalog, JSON.stringify({ mcpServers: { demo: { command: "npx", args: ["demo"], env: { TOKEN: "secret" } } } }));
+    writeFileSync(pi, JSON.stringify({ mcpServers: { demo: { command: "/home/test/.codex/bin/agent-mcp-from-pi", args: ["demo"] }, gone: { command: "/home/test/.codex/bin/agent-mcp-from-pi", args: ["gone"] } } }));
+    writeFileSync(claude, JSON.stringify({ mcpServers: { demo: { command: "/Users/test/.codex/bin/agent-mcp-from-pi", args: ["demo"] } } }));
+    const sources = [
+      { harness: "catalog", path: catalog, scope: "global" as const },
+      { harness: "pi", path: pi, scope: "global" as const },
+      { harness: "claude", path: claude, scope: "global" as const },
+    ];
+    const manifest = scanMcpManifest(sources, { version: 1, servers: {} }, "now");
+    expect(manifest.servers.demo.conflict).toBeFalse();
+    expect(manifest.servers.demo.installations.find((item) => item.harness === "pi")?.indirection).toEqual({ harness: "catalog", server: "demo", path: catalog });
+    expect(inspectMcpConfigurations(sources, "linux")).toContainEqual(expect.objectContaining({ issue: "missing-pi-server", harness: "pi", server: "gone" }));
+    expect(JSON.stringify(manifest)).not.toContain("secret");
+  });
+
   test("resolves agent-mcp-from-pi wrappers in Claude and OpenCode configs", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);

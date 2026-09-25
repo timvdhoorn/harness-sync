@@ -82,7 +82,7 @@ export type McpInstallation = {
   scope: "project" | "global";
   configHash: string;
   effectiveConfigHash?: string;
-  indirection?: { harness: "pi"; server: string; path: string };
+  indirection?: { harness: "pi" | "catalog"; server: string; path: string };
 };
 export type McpAuditIssue = {
   issue: "non-portable-path" | "harness-coupled-launcher" | "missing-pi-server" | "app-owned-harness" | "app-owned-platform";
@@ -584,7 +584,17 @@ function mcpInventory(path: string): string[] {
   try { return Object.keys(normalizeMcpFile(path)); } catch { return []; }
 }
 
-const piWrapperHarnesses = { has: (harness: string) => harness !== "pi" && harness !== "catalog" };
+const sharedCatalogPath = join(home, ".agents", "mcp", "mcp.json");
+
+// Launcher bindings resolve to the shared catalog when present, otherwise to the global Pi config.
+function launcherSource<T extends { source: McpSource }>(loaded: T[]): T | undefined {
+  return loaded.find((item) => item.source.harness === "catalog" && item.source.scope === "global")
+    ?? loaded.find((item) => item.source.harness === "pi" && item.source.scope === "global");
+}
+
+function resolvesLauncher(harness: string): boolean {
+  return harness !== "catalog" && (harness !== "pi" || existsSync(sharedCatalogPath));
+}
 
 export function piServerReference(server: McpServer): string | undefined {
   if (!server.command || basename(server.command) !== "agent-mcp-from-pi") return undefined;
@@ -643,11 +653,11 @@ export function inspectMcpConfigurations(
     if (!existsSync(source.path)) return [];
     try { return [{ source, servers: normalizeMcpFile(source.path) }]; } catch { return []; }
   });
-  const pi = loaded.find((item) => item.source.harness === "pi" && item.source.scope === "global");
+  const pi = launcherSource(loaded);
   const dependents = new Map<string, string[]>();
   const issues: McpAuditIssue[] = [];
 
-  for (const item of loaded.filter((entry) => piWrapperHarnesses.has(entry.source.harness))) {
+  for (const item of loaded.filter((entry) => entry !== pi)) {
     for (const [name, server] of Object.entries(item.servers)) {
       const reference = piServerReference(server);
       if (!reference) continue;
@@ -1083,7 +1093,7 @@ function audit(asJson: boolean, strict = false): void {
     console.log(`MCP provenance: ${mcpProvenance.exists ? "initialized" : "missing"}; servers=${mcpProvenance.servers}; known=${mcpProvenance.known}; unknown=${mcpProvenance.unknown}; conflicts=${mcpProvenance.conflicts.length}`);
     for (const item of mcpIssues) {
       if (item.issue === "missing-pi-server") {
-        console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} references missing Pi server in ${item.targetPath}; indirect harnesses=${item.indirectHarnesses.join(", ")}`);
+        console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} references a server missing from ${item.targetPath}; indirect harnesses=${item.indirectHarnesses.join(", ")}`);
       } else if (item.issue === "harness-coupled-launcher") {
         console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} depends on a harness-specific launcher`);
       } else if (item.issue === "app-owned-harness") {
@@ -1452,6 +1462,7 @@ function mcpSources(): McpSource[] {
     { harness: "opencode", path: join(root, ".opencode", "opencode.json"), scope: "project" },
     { harness: "gemini", path: join(root, ".gemini", "settings.json"), scope: "project" },
     { harness: "catalog", path: join(root, "mcp.json"), scope: "project" },
+    { harness: "catalog", path: sharedCatalogPath, scope: "global" },
     { harness: "pi", path: join(home, ".pi", "mcp", "mcp.json"), scope: "global" },
     { harness: "claude", path: join(home, ".claude.json"), scope: "global" },
     { harness: "codex", path: join(home, ".codex", "config.toml"), scope: "global" },
@@ -1474,7 +1485,7 @@ function mcpTargetPath(harness: string, scope: "project" | "global"): string | u
     pi: { global: join(home, ".pi", "mcp", "mcp.json") },
     hermes: { global: join(home, ".hermes", "config.yaml") },
     goose: { global: join(home, ".config", "goose", "config.yaml") },
-    catalog: { project: join(root, "mcp.json"), global: "" },
+    catalog: { project: join(root, "mcp.json"), global: sharedCatalogPath },
   };
   return paths[harness]?.[scope] || undefined;
 }
@@ -1828,11 +1839,12 @@ export function scanMcpManifest(
     if (!existsSync(source.path)) return [];
     try { return [{ source, servers: normalizeMcpFile(source.path) }]; } catch { return []; }
   });
-  const pi = loaded.find((item) => item.source.harness === "pi" && item.source.scope === "global");
+  const pi = launcherSource(loaded);
   const found = new Map<string, Array<{ server: McpServer; installation: McpInstallation }>>();
-  for (const { source, servers } of loaded) {
+  for (const item of loaded) {
+    const { source, servers } = item;
     for (const [name, rawServer] of Object.entries(servers)) {
-      const reference = piWrapperHarnesses.has(source.harness) ? piServerReference(rawServer) : undefined;
+      const reference = item !== pi ? piServerReference(rawServer) : undefined;
       const effectiveServer = reference && pi?.servers[reference] ? pi.servers[reference] : rawServer;
       const entries = found.get(name) ?? [];
       entries.push({
@@ -1844,7 +1856,7 @@ export function scanMcpManifest(
           configHash: mcpConfigHash(rawServer),
           ...(effectiveServer !== rawServer ? {
             effectiveConfigHash: mcpConfigHash(effectiveServer),
-            indirection: { harness: "pi", server: reference!, path: pi!.source.path },
+            indirection: { harness: pi!.source.harness as "pi" | "catalog", server: reference!, path: pi!.source.path },
           } : {}),
         },
       });
@@ -1884,8 +1896,8 @@ export function sameMcpServer(left: McpServer, right: McpServer): boolean {
 }
 
 function effectiveMcpServers(harness: string, servers: Record<string, McpServer>): Record<string, McpServer> {
-  if (!piWrapperHarnesses.has(harness)) return servers;
-  const piPath = mcpTargetPath("pi", "global");
+  if (!resolvesLauncher(harness)) return servers;
+  const piPath = existsSync(sharedCatalogPath) ? sharedCatalogPath : mcpTargetPath("pi", "global");
   if (!piPath || !existsSync(piPath)) return servers;
   let piServers: Record<string, McpServer>;
   try { piServers = normalizeMcpFile(piPath); } catch { return servers; }
