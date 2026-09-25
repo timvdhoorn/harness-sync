@@ -267,7 +267,7 @@ function backup(paths: string[]): string {
     const target = join(root, createHash("sha256").update(source).digest("hex").slice(0, 16));
     const info = lstatSync(source);
     const kind = info.isSymbolicLink() ? "symlink" : info.isDirectory() ? "directory" : "file";
-    cpSync(source, target, { recursive: true, dereference: false });
+    cpSync(source, target, { recursive: true, dereference: false, verbatimSymlinks: true });
     manifest.push({ source, backup: target, kind });
   }
   writeJsonAtomic(join(root, "manifest.json"), manifest);
@@ -285,7 +285,7 @@ function restoreBackup(root: string): void {
       if (pathExists(item.source)) rmSync(item.source, { recursive: true, force: true });
       if (item.kind === "missing" || !item.backup) continue;
       mkdirSync(dirname(item.source), { recursive: true });
-      cpSync(item.backup, item.source, { recursive: true, dereference: false });
+      cpSync(item.backup, item.source, { recursive: true, dereference: false, verbatimSymlinks: true });
     } catch (error) {
       failed.push(`${item.source} (${(error as Error).message})`);
     }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, embeddedSkillPaths, findSyncthingRoot, harnesses, inferMcpScope, inferMcpUpstream, inspectCanonicalSkillDirectory, inspectHarnessSkillDirectory, inspectHookConfiguration, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectPortableConfigs, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, skillInstallSource, sourceForMcp, validSkillName } from "../scripts/harness-sync";
@@ -563,7 +563,7 @@ describe("MCP normalization", () => {
     mkdirSync(join(root, "dotfiles"), { recursive: true });
     mkdirSync(join(root, ".codex"), { recursive: true });
     writeFileSync(join(root, "dotfiles", "config.toml"), 'model = "o3"\n');
-    symlinkSync(join(root, "dotfiles", "config.toml"), join(root, ".codex", "config.toml"));
+    symlinkSync("../dotfiles/config.toml", join(root, ".codex", "config.toml"));
     mkdirSync(join(root, ".config", "opencode"), { recursive: true });
     writeFileSync(join(root, ".config", "opencode", "opencode.json"), "{}\n");
     chmodSync(join(root, ".config", "opencode"), 0o555);
@@ -581,7 +581,7 @@ describe("MCP normalization", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr.toString()).toContain("rolled back from");
     expect(readFileSync(join(root, "dotfiles", "config.toml"), "utf8")).toBe('model = "o3"\n');
-    expect(lstatSync(join(root, ".codex", "config.toml")).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(join(root, ".codex", "config.toml"))).toBe("../dotfiles/config.toml");
   });
 
   test("refuses to write through a dangling symlink", () => {
