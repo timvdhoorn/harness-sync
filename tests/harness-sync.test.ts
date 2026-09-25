@@ -1003,6 +1003,8 @@ describe("MCP provenance", () => {
     const codexInstall = manifest.servers["context-mode"].installations.find((item) => item.harness === "codex")!;
     expect(piServerReference({ command: "agent-mcp-from-pi", args: ["context-mode"] })).toBe("context-mode");
     expect(piServerReference({ command: "agent-mcp-from-pi-extra", args: ["context-mode"] })).toBeUndefined();
+    expect(piServerReference({ command: "sh", args: ["-c", 'exec "$HOME/.codex/bin/agent-mcp-from-pi" context-mode'] })).toBe("context-mode");
+    expect(piServerReference({ command: "sh", args: ["-c", 'exec "$HOME/.codex/bin/agent-mcp-from-pi" x; rm -r ~'] })).toBeUndefined();
     expect(manifest.servers["context-mode"].conflict).toBeFalse();
     expect(codexInstall.indirection).toEqual({ harness: "pi", server: "context-mode", path: pi });
     expect(codexInstall.effectiveConfigHash).not.toBe(codexInstall.configHash);

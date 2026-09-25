@@ -596,9 +596,16 @@ function resolvesLauncher(harness: string): boolean {
   return harness !== "catalog" && (harness !== "pi" || existsSync(sharedCatalogPath));
 }
 
+const portableLauncherScript = /^exec "\$HOME\/(?:[^"$`\\]+\/)?agent-mcp-from-pi" ([A-Za-z0-9._-]+)$/;
+
 export function piServerReference(server: McpServer): string | undefined {
-  if (!server.command || basename(server.command) !== "agent-mcp-from-pi") return undefined;
-  if (server.url || server.args?.length !== 1 || !server.args[0]) return undefined;
+  if (!server.command || server.url) return undefined;
+  // Home-independent form for configs shared between machines: sh -c 'exec "$HOME/.../agent-mcp-from-pi" name'
+  if (basename(server.command) === "sh" && server.args?.length === 2 && server.args[0] === "-c") {
+    return server.args[1].match(portableLauncherScript)?.[1];
+  }
+  if (basename(server.command) !== "agent-mcp-from-pi") return undefined;
+  if (server.args?.length !== 1 || !server.args[0]) return undefined;
   return server.args[0];
 }
 
