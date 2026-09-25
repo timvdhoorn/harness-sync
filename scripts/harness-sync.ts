@@ -1121,6 +1121,35 @@ function applyRequired(args: string[]): boolean {
   return apply;
 }
 
+const commandFlags: Record<string, { switches: string[]; values: string[] }> = {
+  audit: { switches: ["--json", "--strict"], values: [] },
+  doctor: { switches: ["--json", "--strict"], values: [] },
+  "portable-config register": { switches: ["--apply", "--confirmed", "--replace-source"], values: ["--id", "--source", "--target", "--seed-from", "--format"] },
+  "portable-config render": { switches: ["--apply", "--confirmed"], values: ["--id"] },
+  init: { switches: ["--apply", "--confirmed"], values: [] },
+  instructions: { switches: ["--apply", "--confirmed", "--replace"], values: ["--scope"] },
+  add: { switches: ["--apply", "--confirmed", "--full-depth"], values: ["--skill"] },
+  remove: { switches: ["--apply", "--confirmed"], values: [] },
+  update: { switches: ["--apply", "--confirmed"], values: [] },
+  mcp: { switches: ["--apply", "--confirmed", "--direct", "--non-interactive"], values: ["--from", "--target", "--scope", "--server", "--resolve"] },
+  "mcp-remove": { switches: ["--apply", "--confirmed"], values: ["--server", "--target", "--scope"] },
+};
+
+export function assertKnownFlags(command: string, args: string[]): void {
+  const allowed = commandFlags[command];
+  if (!allowed) return;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (allowed.values.includes(arg)) {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("--")) fail(`${arg} requires a value`);
+      index++;
+    } else if (arg.startsWith("-") && !allowed.switches.includes(arg)) {
+      fail(`unknown option for ${command}: ${arg}`);
+    }
+  }
+}
+
 function argumentValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
@@ -1141,7 +1170,7 @@ function portableConfigRegister(args: string[]): void {
   const seed = resolvePortablePath(seedValue ?? targetValue);
   if (source === target) fail("portable source and rendered target must be different paths");
   if (!existsSync(seed) && !existsSync(source)) fail(`portable source seed is missing: ${seed}`);
-  const candidate = existsSync(source) ? source : seed;
+  const candidate = existsSync(source) && !args.includes("--replace-source") ? source : seed;
   if (format === "json") {
     try { readJson(candidate); } catch { fail(`portable source is not valid JSON: ${candidate}`); }
     const hookIssues = inspectHookConfiguration(candidate, { shared: true });
@@ -1222,7 +1251,7 @@ function portableConfigRender(args: string[]): void {
       }
       chmodSync(item.target, 0o600);
     }
-    const remaining = inspectPortableConfigs(manifest);
+    const remaining = inspectPortableConfigs({ ...manifest, configs: Object.fromEntries(entries) });
     if (remaining.length) throw new Error(`render left ${remaining.length} portable config issue(s)`);
   });
   console.log(`Rendered ${operations.length} portable config(s). Backup: ${backupRoot}`);
@@ -1298,8 +1327,9 @@ function npxLockOwns(name: string): boolean {
   for (const path of globalSkillLocks()) {
     if (!existsSync(path)) continue;
     try {
-      const text = readFileSync(path, "utf8");
-      if (text.includes(`\"${name}\"`)) return true;
+      const lock = readJson(path);
+      const skills = lock?.skills && typeof lock.skills === "object" ? lock.skills : lock;
+      if (skills && typeof skills === "object" && Object.hasOwn(skills, name)) return true;
     } catch { /* audit reports malformed files separately */ }
   }
   return false;
@@ -1340,7 +1370,8 @@ function updateSkills(names: string[], args: string[]): void {
   if (missing.length) fail(`skills not found in manifest; run init first: ${missing.join(", ")}`);
   const unknown = requested.filter((name) => !manifest.skills[name].source);
   const tracked = requested.filter((name) => manifest.skills[name].source);
-  for (const name of tracked) console.log(`Plan: update ${name} from ${skillInstallSource(manifest.skills[name])} (current ${manifest.skills[name].version})`);
+  console.log(`Plan: reinstall ${tracked.length} tracked skill(s) from recorded sources; upstream changes are not compared before apply`);
+  for (const name of tracked) console.log(`  ${name} from ${skillInstallSource(manifest.skills[name])} (current ${manifest.skills[name].version})`);
   if (unknown.length) console.log(`Skip (unknown source): ${unknown.join(", ")}`);
   if (cleanNames.length && unknown.length) fail(`cannot update skills with unknown source: ${unknown.join(", ")}`);
   if (!apply) return;
@@ -2069,29 +2100,35 @@ export function buildMcpSyncPlan(
   return { plan, definitions };
 }
 
+const supportedMcpTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
+const directTargets = new Set(["codex", "pi", "opencode", "hermes", "goose", "catalog"]);
+
+function resolveMcpTargets(requested: string[]): string[] {
+  const detected = detectedHarnesses();
+  const targetNames = requested.length
+    ? [...new Set(requested)]
+    : detected.filter((item) => item.installed && supportedMcpTargets.includes(item.id)).map((item) => item.id);
+  for (const target of targetNames) {
+    if (!supportedMcpTargets.includes(target)) fail(`unsupported MCP target: ${target}`);
+    if (!directTargets.has(target) && !detected.some((item) => item.id === target && item.installed)) fail(`MCP target not installed: ${target}`);
+  }
+  return targetNames;
+}
+
 function mcpSync(args: string[]): void {
   const apply = applyRequired(args);
   const valueAfter = (flag: string, fallback: string) => { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : fallback; };
   const valuesAfter = (flag: string) => args.flatMap((arg, index) => arg === flag && args[index + 1] ? [args[index + 1]] : []);
   const from = valueAfter("--from", "auto");
   const scope = valueAfter("--scope", "auto");
+  if (!["auto", "project", "global"].includes(scope)) fail("--scope must be auto, project, or global");
   const source = sourceForMcp(from, scope);
   const effectiveScope = scope === "auto" ? source.scope : scope;
   const requestedServer = valueAfter("--server", "");
   const allServers = effectiveMcpServers(source.harness, normalizeMcpFile(source.path));
   const servers = requestedServer ? Object.fromEntries(Object.entries(allServers).filter(([name]) => name === requestedServer)) : allServers;
   if (requestedServer && !Object.keys(servers).length) fail(`MCP server not found in source: ${requestedServer}`);
-  const requestedTargets = valuesAfter("--target");
-  const supportedTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
-  const directTargets = new Set(["codex", "pi", "opencode", "hermes", "goose", "catalog"]);
-  const detected = detectedHarnesses();
-  const targetNames = requestedTargets.length
-    ? [...new Set(requestedTargets)]
-    : detected.filter((item) => item.installed && supportedTargets.includes(item.id)).map((item) => item.id);
-  for (const target of targetNames) {
-    if (!supportedTargets.includes(target)) fail(`unsupported MCP target: ${target}`);
-    if (target !== "catalog" && !directTargets.has(target) && !detected.some((item) => item.id === target && item.installed)) fail(`MCP target not installed: ${target}`);
-  }
+  const targetNames = resolveMcpTargets(valuesAfter("--target"));
   const unsupported = targetNames.filter((target) => !mcpTargetPath(target, effectiveScope)).map((target) => `${target}:${effectiveScope}`);
   const replaceWrappers = args.includes("--direct");
   const targets: McpTargetBinding[] = targetNames.flatMap((harness) => {
@@ -2153,7 +2190,7 @@ function mcpSync(args: string[]): void {
     if (unsafe.length) fail(`secret-bearing project configs must be gitignored: ${unsafe.join(", ")}`);
   }
   const backupRoot = withBackup("MCP sync", [...targetPaths, mcpManifestPath], () => {
-    for (const harness of ["codex", "pi", "opencode", "hermes", "goose", "catalog"]) {
+    for (const harness of directTargets) {
       const target = targets.find((item) => item.harness === harness);
       const selected = Object.fromEntries(built.plan.operations.filter((operation) => operation.targets.some((item) => item.binding === (target ? bindingId(target) : ""))).map((operation) => [operation.server, built.definitions[operation.server]]));
       const path = target?.path;
@@ -2164,7 +2201,7 @@ function mcpSync(args: string[]): void {
       if (directTargets.has(target.harness)) continue;
       const server = built.definitions[operation.server];
       if (["claude", "grok", "gemini"].includes(target.harness)) {
-        run(mcpNativeCliCommand(target.harness as "claude" | "grok" | "gemini", effectiveScope as "project" | "global", operation.server, server));
+        run(mcpNativeCliCommand(target.harness as "claude" | "grok" | "gemini", effectiveScope as "project" | "global", operation.server, server), { cwd: projectRoot() });
         if (existsSync(target.path)) chmodSync(target.path, 0o600);
       }
     }
@@ -2183,17 +2220,7 @@ function mcpRemove(args: string[]): void {
   if (!serverNames.length) fail("mcp-remove requires at least one --server <name>");
   if (serverNames.some((name) => name.startsWith("-") || /[\0\r\n]/.test(name))) fail("invalid MCP server name");
 
-  const requestedTargets = valuesAfter("--target");
-  const supportedTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
-  const directTargets = new Set(["codex", "pi", "opencode", "hermes", "goose", "catalog"]);
-  const detected = detectedHarnesses();
-  const targetNames = requestedTargets.length
-    ? [...new Set(requestedTargets)]
-    : detected.filter((item) => item.installed && supportedTargets.includes(item.id)).map((item) => item.id);
-  for (const target of targetNames) {
-    if (!supportedTargets.includes(target)) fail(`unsupported MCP target: ${target}`);
-    if (target !== "catalog" && !directTargets.has(target) && !detected.some((item) => item.id === target && item.installed)) fail(`MCP target not installed: ${target}`);
-  }
+  const targetNames = resolveMcpTargets(valuesAfter("--target"));
   const unsupported = targetNames.filter((target) => !mcpTargetPath(target, scope)).map((target) => `${target}:${scope}`);
   const targets: McpTargetBinding[] = targetNames.flatMap((harness) => {
     const path = mcpTargetPath(harness, scope);
@@ -2217,7 +2244,7 @@ function mcpRemove(args: string[]): void {
       if (!selected.length) continue;
       if (directTargets.has(target.harness)) removeDirectMcpServers(target.harness, target.path, selected);
       else for (const name of selected) {
-        run(mcpNativeCliRemoveCommand(target.harness as "claude" | "grok" | "gemini", scope, name));
+        run(mcpNativeCliRemoveCommand(target.harness as "claude" | "grok" | "gemini", scope, name), { cwd: projectRoot() });
         if (existsSync(target.path)) chmodSync(target.path, 0o600);
       }
     }
@@ -2257,7 +2284,10 @@ Run a mutation command without --apply for a plan. Writes require --apply --conf
 export function main(argv = process.argv.slice(2)): void {
   const [command, ...args] = argv;
   try {
-    if (!command || command === "--help" || command === "-h") return usage();
+    if (!command || argv.includes("--help") || argv.includes("-h")) return usage();
+    const flagScope = command === "portable-config" ? `${command} ${args[0] ?? ""}` : command;
+    const addSourceIsCommand = command === "add" && (args[0] === "npx" || args[0]?.includes(" "));
+    if (!addSourceIsCommand) assertKnownFlags(flagScope, command === "portable-config" ? args.slice(1) : args);
     if (command === "audit") return audit(args.includes("--json"), args.includes("--strict"));
     if (command === "doctor") return doctor(args.includes("--json"), args.includes("--strict"));
     if (command === "portable-config") return portableConfigCommand(args);

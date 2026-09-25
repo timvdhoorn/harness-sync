@@ -202,6 +202,53 @@ esac
     expect(runCli(root, "doctor", "--strict", "--json").exitCode).toBe(0);
   });
 
+  test.each([["mcp", "--help"], ["remove", "demo", "--help"], ["update", "-h"]])("prints usage instead of running %s with a help flag", (...args) => {
+    const root = fixture();
+    const before = snapshot(root);
+    const result = runCli(root, ...args);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain("Commands:");
+    expect(snapshot(root)).toBe(before);
+  });
+
+  test.each([["audit", "--jsn"], ["mcp", "--sever", "demo"], ["mcp-remove", "--server", "--target"], ["mcp", "--scope", "globl"]])("rejects invalid options: %s %s", (...args) => {
+    const root = fixture();
+    const result = runCli(root, ...args);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString() + result.stdout.toString()).toMatch(/unknown option|requires a value|--scope must be/);
+  });
+
+  test("validates the seed before replacing an existing portable source", () => {
+    const root = fixture();
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    const target = join(root, ".claude", "settings.json");
+    const source = join(root, ".agents", "harness-sync", "claude-settings.json");
+    const seed = join(root, "seed.json");
+    writeFileSync(target, "{}\n");
+    expect(runCli(root, "portable-config", "register", "--id", "claude-settings", "--source", source, "--target", target, "--seed-from", target, "--apply", "--confirmed").exitCode).toBe(0);
+    writeFileSync(seed, "{ not json");
+    const result = runCli(root, "portable-config", "register", "--id", "claude-settings", "--source", source, "--target", target, "--seed-from", seed, "--replace-source", "--apply", "--confirmed");
+    expect(result.exitCode).toBe(1);
+    expect(readFileSync(source, "utf8")).toBe("{}\n");
+  });
+
+  test("renders one selected portable config even when another entry has an issue", () => {
+    const root = fixture();
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    const target = join(root, ".claude", "settings.json");
+    const source = join(root, ".agents", "harness-sync", "claude-settings.json");
+    writeFileSync(target, "{}\n");
+    expect(runCli(root, "portable-config", "register", "--id", "claude-settings", "--source", source, "--target", target, "--seed-from", target, "--apply", "--confirmed").exitCode).toBe(0);
+    const other = join(root, ".other", "config.json");
+    mkdirSync(dirname(other), { recursive: true });
+    writeFileSync(other, "{}\n");
+    expect(runCli(root, "portable-config", "register", "--id", "other", "--source", join(root, ".agents", "harness-sync", "other.json"), "--target", other, "--seed-from", other, "--apply", "--confirmed").exitCode).toBe(0);
+    writeFileSync(other, "{\"drift\":true}\n");
+    writeFileSync(source, "{\"theme\":\"light\"}\n");
+    expect(runCli(root, "portable-config", "render", "--id", "claude-settings", "--apply", "--confirmed").exitCode).toBe(0);
+    expect(readFileSync(target, "utf8")).toBe("{\"theme\":\"light\"}\n");
+  });
+
   test("rolls back and reports the backup when an apply step fails", () => {
     const root = fixture();
     mkdirSync(join(root, ".claude"), { recursive: true });
