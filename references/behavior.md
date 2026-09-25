@@ -27,6 +27,24 @@ OpenCode discovers canonical `~/.agents/skills` itself. Keep it out of the `npx 
 
 Use native MCP CLIs for Claude, Grok, and Gemini. Render Codex TOML, Pi JSON, OpenCode JSON, Hermes YAML, and Goose YAML while preserving unrelated config. Detect OpenCode stable and v2 shapes separately. After every native write, keep the target config private with mode `0600`.
 
+## Portable links
+
+Store relative targets in skill and instruction symlinks. Resolve the destination
+under the target machine's home and verify that it exists. Calculate the relative
+path from the link's physical parent directory, resolving directory aliases first.
+For example, `~/.claude/skills/issues` points to `../../.agents/skills/issues`;
+the Pi equivalent needs `../../../.agents/skills/issues`.
+
+Symlink text expands neither `~` nor `$HOME`. Absolute `/home/<user>` and
+`/Users/<user>` targets cannot travel between different home directories.
+Include normalization in the plan and preserve the original link text in the
+backup. Preserve real files and directories; report missing destinations.
+
+Check links after installation because installers may create absolute targets.
+Completion requires relative link text, successful resolution and the intended
+skill content. If a broken link blocks the CLI audit, repair its verified target
+with a backup, then rerun the audit.
+
 ## Shared hook configuration
 
 Treat hooks loaded from a synchronized settings file as cross-machine configuration, even when another harness loads them through compatibility behavior. Inventory every hook command before changing that file. Absolute home paths under `/Users/<name>` or `/home/<name>` are non-portable drift; use a shell-expanded `${HOME}` path when the hook format supports it. Symlink text does not expand home variables.
@@ -59,6 +77,29 @@ Marketplace discovery is read-only. Deduplicate identical cached skills across C
 
 ## MCP
 
+### MCP path portability
+
+Before synchronization, inspect filesystem paths in `command`, `args`, `cwd` and
+path-valued environment settings. Verify their intended destinations on the target
+machine. Preserve URLs, credentials and other non-path strings.
+
+Prefer commands resolved through the target process's PATH. For filesystem paths,
+use relative paths with a known base or supported home-variable syntax. Verify
+expansion against the installed client or current official documentation: JSON
+and TOML do not themselves expand `~` or `$HOME`.
+
+When a client requires absolute paths, derive them from the destination's home
+and keep the rendered configuration machine-local. Synchronize its portable source
+definition and report the exception. Missing executables or files block that
+binding; preserve its existing configuration until resolved.
+
+Include conversion in the scoped plan and backups. Verify the changed launcher's
+paths under its actual working directory and environment, then perform a supported
+read-only MCP initialization or tools-list check. Keep server selection,
+permissions and conflict decisions unchanged.
+
+### Sources and bindings
+
 Default source and scope are `auto`. Sources may be Codex or Grok TOML; Claude, Pi, OpenCode, or Gemini JSON/JSONC; Hermes or Goose YAML; the repository-local `mcp.json` catalog; or an explicit path. The catalog is gitignored, retains complete definitions including environment values, and is used explicitly with `--from catalog` or `--target catalog`. Prefer project sources, then global sources. Pi uses the global `~/.pi/mcp/mcp.json` and has no project scope. Infer an explicit path inside the Git root as project scope. Never silently change project/global scope; report unsupported Pi, Hermes, or Goose project scope instead of writing globally.
 
 Treat MCP launchers fingerprinted to a ChatGPT/Codex application bundle as machine-local, macOS-only, and Codex-owned. This includes the bundled `cua_node/bin/node_repl` host and the `SkyComputerUseClient mcp` executable inside `Codex Computer Use.app`. Classify these definitions from their exact launcher shape, never from server names such as `node_repl` or `computer-use`. Audit placement outside Codex or macOS without exposing environment or header values. Sync plans list incompatible bindings as skipped and never carry their launcher definition into an incompatible write; an ordinary same-name MCP remains a convergence candidate. Machine-generated app definitions are not cross-machine convergence candidates because app versions and trust metadata may differ: preserve each Mac's Codex-owned definition.
@@ -67,7 +108,7 @@ Follow an exact Codex `agent-mcp-from-pi <server-name>` launcher to the matching
 
 Report a launcher under another harness's `~/.agents/<harness>/...` directory as harness-coupled. Prefer a reviewed direct definition before convergence; do not infer arbitrary shell behavior.
 
-On Linux, audit absolute macOS paths under `/Users/<name>/...` and `/opt/homebrew/...` in MCP `command`, `args`, `cwd`, and environment values. Report the config file, server, field, and every wrapper-dependent harness; inspect the offending value locally rather than printing it. A `~` home reference is portable: preserve it in rendering and expand it only for local file access.
+Report foreign-machine paths by config file, server, field and every wrapper-dependent harness. Inspect values locally without printing them. Apply MCP path portability above when repairing them.
 
 Preserve secrets. Before writing a project file containing likely secret literals, prove the file is gitignored. Otherwise block apply. Never print secret values; report keys only.
 

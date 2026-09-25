@@ -292,6 +292,23 @@ describe("MCP normalization", () => {
     })).toBeUndefined();
   });
 
+  test("classifies the local Cua Driver MCP launcher as Claude-owned on macOS", () => {
+    for (const command of ["/Applications/CuaDriver.app/Contents/MacOS/cua-driver", "/Users/example/.local/bin/cua-driver"]) {
+      expect(classifyAppOwnedMcp({ command, args: ["mcp"] })).toEqual({ owner: "claude", platform: "darwin", field: "command", value: command });
+    }
+    expect(classifyAppOwnedMcp({ command: "cua-driver", args: ["mcp"] })).toBeUndefined();
+    expect(classifyAppOwnedMcp({ command: "/Users/example/.local/bin/cua-driver", args: ["serve"] })).toBeUndefined();
+    const source = { harness: "claude", path: "/work/.claude.json", scope: "global" as const, servers: {
+      "cua-driver": { command: "/Users/example/.local/bin/cua-driver", args: ["mcp"] },
+    } };
+    const targets = [
+      { harness: "claude", path: "/work/.claude.json", scope: "global" as const, servers: {} },
+      { harness: "codex", path: "/work/.codex/config.toml", scope: "global" as const, servers: {} },
+    ];
+    const plan = buildMcpSyncPlan(source, targets, {}, "non-interactive", "darwin");
+    expect(plan.plan.skippedIncompatible).toEqual([{ server: "cua-driver", binding: "codex:/work/.codex/config.toml", reasons: ["requires-claude"] }]);
+  });
+
   test("skips app-owned definitions for incompatible sync targets and platforms", () => {
     const source = { harness: "catalog", path: "/work/mcp.json", scope: "global" as const, servers: {
       node_repl: {

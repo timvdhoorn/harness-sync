@@ -106,8 +106,8 @@ export type TrackedMcp = {
 export type McpManifest = { version: 1; servers: Record<string, TrackedMcp> };
 export type McpTargetBinding = McpSource & { servers: Record<string, McpServer>; managedWrappers?: string[] };
 export type McpResolution = { action: "variant" | "merge" | "skip"; variant?: string };
-type AppOwnedMcp = { owner: "codex"; platform: "darwin"; field: "command"; value: string };
-type McpCompatibilityReason = "requires-codex" | "requires-darwin" | "preserve-app-owned";
+type AppOwnedMcp = { owner: "codex" | "claude"; platform: "darwin"; field: "command"; value: string };
+type McpCompatibilityReason = "requires-codex" | "requires-claude" | "requires-darwin" | "preserve-app-owned";
 export type McpSyncPlan = {
   version: 1;
   mode: "interactive" | "non-interactive";
@@ -558,6 +558,7 @@ function harnessCoupledLauncherValues(value: string): string[] {
 }
 
 const computerUseLauncher = "Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+const cuaDriverLauncher = /^(?:\/Applications\/CuaDriver\.app\/Contents\/MacOS\/cua-driver|\/Users\/[^/]+\/\.local\/bin\/cua-driver)$/;
 const userCodexComputerUseLauncher = /^\/Users\/[^/]+\/\.codex\/(?:(?!\.{1,2}\/)[^/]+\/)*Codex Computer Use\.app\/Contents\/SharedSupport\/SkyComputerUseClient\.app\/Contents\/MacOS\/SkyComputerUseClient$/;
 
 export function classifyAppOwnedMcp(server: McpServer): AppOwnedMcp | undefined {
@@ -575,6 +576,9 @@ export function classifyAppOwnedMcp(server: McpServer): AppOwnedMcp | undefined 
   ) {
     return { owner: "codex", platform: "darwin", field: "command", value: command };
   }
+  if (cuaDriverLauncher.test(command) && server.args?.length === 1 && server.args[0] === "mcp") {
+    return { owner: "claude", platform: "darwin", field: "command", value: command };
+  }
   return undefined;
 }
 
@@ -586,7 +590,7 @@ function appOwnedMcpCompatibility(
   const ownership = classifyAppOwnedMcp(server);
   if (!ownership) return [];
   return [
-    ...(harness === ownership.owner ? [] : ["requires-codex" as const]),
+    ...(harness === ownership.owner ? [] : [`requires-${ownership.owner}` as const]),
     ...(currentPlatform === ownership.platform ? [] : ["requires-darwin" as const]),
   ];
 }
@@ -1048,7 +1052,7 @@ function audit(asJson: boolean, strict = false): void {
       } else if (item.issue === "harness-coupled-launcher") {
         console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} depends on a harness-specific launcher`);
       } else if (item.issue === "app-owned-harness") {
-        console.log(`MCP ownership: ${item.path}: ${item.server} ${item.field}=${item.value} is owned by Codex and cannot be used by ${item.harness}`);
+        console.log(`MCP ownership: ${item.path}: ${item.server} ${item.field}=${item.value} is owned by ${classifyAppOwnedMcp({ command: item.value, args: ["mcp"] })?.owner === "claude" ? "Claude Code" : "Codex"} and cannot be used by ${item.harness}`);
       } else if (item.issue === "app-owned-platform") {
         console.log(`MCP ownership: ${item.path}: ${item.server} ${item.field}=${item.value} is macOS-only and cannot be used on ${platform()}`);
       } else {
