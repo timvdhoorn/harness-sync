@@ -1010,6 +1010,24 @@ describe("MCP provenance", () => {
     expect(inspectMcpConfigurations(sources, "linux")).toContainEqual(expect.objectContaining({ issue: "missing-pi-server", harness: "grok", server: "typo" }));
   });
 
+  test("resolves agent-mcp-from-pi wrappers in Claude and OpenCode configs", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const pi = join(root, "mcp.json");
+    const claude = join(root, "claude.json");
+    const opencode = join(root, "opencode.json");
+    writeFileSync(pi, JSON.stringify({ mcpServers: { demo: { command: "npx", args: ["demo"], env: { TOKEN: "secret" } } } }));
+    writeFileSync(claude, JSON.stringify({ mcpServers: { demo: { command: "/Users/test/.codex/bin/agent-mcp-from-pi", args: ["demo"] } } }));
+    writeFileSync(opencode, JSON.stringify({ mcp: { demo: { type: "local", command: ["/home/test/.codex/bin/agent-mcp-from-pi", "demo"], enabled: true } } }));
+    const manifest = scanMcpManifest([
+      { harness: "claude", path: claude, scope: "global" },
+      { harness: "opencode", path: opencode, scope: "global" },
+      { harness: "pi", path: pi, scope: "global" },
+    ], { version: 1, servers: {} }, "now");
+    expect(manifest.servers.demo.conflict).toBeFalse();
+    expect(JSON.stringify(manifest)).not.toContain("secret");
+  });
+
   test("reports non-portable Pi env paths and their indirect Codex dependency", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);

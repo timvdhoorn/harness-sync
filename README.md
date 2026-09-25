@@ -298,7 +298,7 @@ A same-name semantic difference is a conflict. Resolve each conflict explicitly:
 non-interactive mode exits with code 2 and performs no writes.
 
 Harness Sync also recognizes the optional
-`agent-mcp-from-pi <server-name>` launcher used by some Codex configurations. It
+`agent-mcp-from-pi <server-name>` launcher in any harness config. It
 can compare the effective Pi definition and, with `--direct`, replace a
 proven-equal wrapper with that direct definition. Other installations do not
 need this adapter.

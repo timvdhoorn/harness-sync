@@ -584,7 +584,7 @@ function mcpInventory(path: string): string[] {
   try { return Object.keys(normalizeMcpFile(path)); } catch { return []; }
 }
 
-const piWrapperHarnesses = new Set(["codex", "grok"]);
+const piWrapperHarnesses = { has: (harness: string) => harness !== "pi" && harness !== "catalog" };
 
 export function piServerReference(server: McpServer): string | undefined {
   if (!server.command || basename(server.command) !== "agent-mcp-from-pi") return undefined;
