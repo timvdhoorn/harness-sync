@@ -10,7 +10,7 @@ disable-model-invocation: true
 
 Resolve `scripts/harness-sync.ts` beside this skill to an absolute path. Run it with `bun run <absolute-script-path>` while keeping the requested project's working directory. The CLI uses that directory to discover project scope. If the bundled script is missing, report the installation problem before proceeding.
 
-Run `--help` for current syntax. With no requested operation, run `audit` and select the next action from the task. Record the target project, user scope, and selected harnesses before planning.
+Run `--help` for current syntax. A bare `/harness-sync` is a health pass: run `audit --strict --json`, plan a repair for each actionable finding, apply the repairs that restore the recorded state, and ask only about removals, overwrites of unrelated content, or secret moves. Finish when strict audit is clean or every remaining finding is reported with its reason. Record the target project, user scope, and selected harnesses before planning.
 
 ## Load the relevant behavior
 
