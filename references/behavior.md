@@ -13,11 +13,13 @@ Strict audit is an inventory check, not a scoped synchronization plan or proof t
 ## State and recovery
 
 - Canonical skills: `~/.agents/skills`.
-- Backups: `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/<timestamp>`; directory mode `0700`, files `0600`.
+- Backups: `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/<timestamp>`, directory mode `0700`; copies keep their source file modes. Each successful apply keeps the newest 10 timestamped backups. Manually named directories there are never pruned.
 - `npx skills` locks remain evidence, not desired state.
 - Skill provenance lives in `${XDG_STATE_HOME:-~/.local/state}/harness-sync/skills.json`. It records source, exact installed content version, current content hash, and timestamps. `init` imports trustworthy metadata from existing `npx skills` locks and marks everything else as unknown rather than guessing.
 - MCP provenance lives in `${XDG_STATE_HOME:-~/.local/state}/harness-sync/mcps.json`. It records semantic hashes and config locations without secret values. Infer upstreams only for remote URLs and recognizable npm, PyPI, or container launchers; keep other sources unknown. Mark same-name semantic differences as conflicts.
-- Back up every affected path before mutation. Restore automatically when apply fails.
+- Back up every affected path before mutation. Restore automatically when apply fails; the error names the backup, and says so when the restore itself failed.
+- Writes to a symlinked config land in its real file and keep the link. A dangling symlink blocks the write.
+- Direct MCP renders (Codex, Pi, OpenCode, Hermes, Goose) are parsed again after writing. A result that fails to parse or changes anything outside the selected servers is reverted. YAML and JSONC rewrites still drop comments.
 
 ## Harnesses
 
@@ -104,7 +106,7 @@ Default source and scope are `auto`. Sources may be Codex or Grok TOML; Claude, 
 
 Treat MCP launchers fingerprinted to a ChatGPT/Codex application bundle as machine-local, macOS-only, and Codex-owned. This includes the bundled `cua_node/bin/node_repl` host and the `SkyComputerUseClient mcp` executable inside `Codex Computer Use.app`. Classify these definitions from their exact launcher shape, never from server names such as `node_repl` or `computer-use`. Audit placement outside Codex or macOS without exposing environment or header values. Sync plans list incompatible bindings as skipped and never carry their launcher definition into an incompatible write; an ordinary same-name MCP remains a convergence candidate. Machine-generated app definitions are not cross-machine convergence candidates because app versions and trust metadata may differ: preserve each Mac's Codex-owned definition.
 
-Follow an exact Codex `agent-mcp-from-pi <server-name>` launcher to the matching Pi server for audit, provenance, and semantic comparison. Keep the Codex launcher's raw hash and Pi indirection beside the effective hash. Replace a proven-equal wrapper only when `--direct` is explicitly selected; the replacement uses the effective definition, never the wrapper command. Report a missing referenced Pi server with both config paths and the dependent Codex server.
+Follow an exact `agent-mcp-from-pi <server-name>` launcher to the matching server in the launcher source for audit, provenance, and semantic comparison; such a binding is equal to that definition. The launcher source is the Syncthing-shared catalog `~/.agents/mcp/mcp.json` when it exists, otherwise the global Pi config. With the shared catalog, Pi is a client like the other harnesses. The catalog holds secret values: keep it mode `0600` and out of Git. Keep the launcher's raw hash and Pi indirection beside the effective hash. For Codex, replace a proven-equal wrapper only when `--direct` is explicitly selected; the replacement uses the effective definition, never the wrapper command. Report a missing referenced Pi server with both config paths and the dependent server.
 
 Report a launcher under another harness's `~/.agents/<harness>/...` directory as harness-coupled. Prefer a reviewed direct definition before convergence; do not infer arbitrary shell behavior.
 

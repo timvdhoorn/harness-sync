@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildMcpRemovalPlan, buildMcpSyncPlan, classifyAppOwnedMcp, discoverMarketplaceSkills, embeddedSkillPaths, findSyncthingRoot, harnesses, inferMcpScope, inferMcpUpstream, inspectCanonicalSkillDirectory, inspectHarnessSkillDirectory, inspectHookConfiguration, inspectInstructions, inspectUserInstructions, inspectMcpConfigurations, inspectPortableConfigs, inspectSkillDirectory, mcpNativeCliCommand, mcpNativeCliRemoveCommand, normalizeAddInput, normalizeMcpFile, normalizeMcpJson, piServerReference, removalTargets, removeDirectMcpServers, removeExistingPath, renderDirectTarget, sameMcpServer, scanMcpManifest, scanSkillManifest, skillInstallSource, sourceForMcp, validSkillName } from "../scripts/harness-sync";
@@ -525,6 +525,90 @@ describe("MCP normalization", () => {
     }
   });
 
+  test("replaces multi-line Codex values without leaving fragments", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const path = join(root, "config.toml");
+    writeFileSync(path, 'model = "gpt"\n\n[mcp_servers.foo]\ncommand = "npx"\nargs = [\n  "-y",\n  "pkg",\n]\nenv = { A = "1" }\nstartup_timeout_sec = 20\n\n[[skills.config]]\npath = "/p"\n');
+    renderDirectTarget("codex", path, { foo: { command: "npx", args: ["-y", "pkg2"] } });
+    const parsed: any = Bun.TOML.parse(readFileSync(path, "utf8"));
+    expect(parsed.mcp_servers.foo.args).toEqual(["-y", "pkg2"]);
+    expect(parsed.mcp_servers.foo.startup_timeout_sec).toBe(20);
+    expect(parsed.mcp_servers.foo.env).toBeUndefined();
+    expect(parsed.skills.config).toEqual([{ path: "/p" }]);
+    expect(parsed.model).toBe("gpt");
+  });
+
+  test("removes Codex servers without touching array tables or commented headers", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const path = join(root, "config.toml");
+    writeFileSync(path, '[mcp_servers.foo]\ncommand = "x"\n\n[[skills.config]]\npath = "/p"\n\n[mcp_servers.bar] # keep\ncommand = "y"\n');
+    removeDirectMcpServers("codex", path, ["foo"]);
+    const parsed: any = Bun.TOML.parse(readFileSync(path, "utf8"));
+    expect(parsed.mcp_servers.foo).toBeUndefined();
+    expect(parsed.mcp_servers.bar.command).toBe("y");
+    expect(parsed.skills.config).toEqual([{ path: "/p" }]);
+  });
+
+  test("leaves a Codex config unchanged when a rewrite would lose unrelated settings", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const path = join(root, "config.toml");
+    const original = '[mcp_servers."a]b"]\ncommand = "x"\n\n[mcp_servers.keep]\ncommand = "y"\n';
+    writeFileSync(path, original);
+    expect(() => removeDirectMcpServers("codex", path, ["a]b"])).toThrow("left unchanged");
+    expect(readFileSync(path, "utf8")).toBe(original);
+  });
+
+  test("writes through a symlinked target config instead of replacing the link", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const real = join(root, "dotfiles", "mcp.json");
+    mkdirSync(dirname(real), { recursive: true });
+    writeFileSync(real, "{}\n");
+    const link = join(root, "mcp.json");
+    symlinkSync(real, link);
+    renderDirectTarget("pi", link, { demo: { command: "npx", args: ["demo"] } });
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(normalizeMcpFile(real).demo?.command).toBe("npx");
+  });
+
+  test("restores the real file behind a symlinked config when a later step fails", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    mkdirSync(join(root, "dotfiles"), { recursive: true });
+    mkdirSync(join(root, ".codex"), { recursive: true });
+    writeFileSync(join(root, "dotfiles", "config.toml"), 'model = "o3"\n');
+    symlinkSync("../dotfiles/config.toml", join(root, ".codex", "config.toml"));
+    mkdirSync(join(root, ".config", "opencode"), { recursive: true });
+    writeFileSync(join(root, ".config", "opencode", "opencode.json"), "{}\n");
+    chmodSync(join(root, ".config", "opencode"), 0o555);
+    writeFileSync(join(root, "source.json"), JSON.stringify({ mcpServers: { fs: { command: "npx", args: ["fs"] } } }));
+    mkdirSync(join(root, "bin"));
+    for (const name of ["codex", "opencode"]) {
+      writeFileSync(join(root, "bin", name), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(root, "bin", name), 0o755);
+    }
+    const result = Bun.spawnSync([process.execPath, "run", join(import.meta.dir, "..", "scripts", "harness-sync.ts"), "mcp", "--from", join(root, "source.json"), "--target", "codex", "--target", "opencode", "--scope", "global", "--non-interactive", "--apply", "--confirmed"], {
+      cwd: root,
+      env: { ...process.env, HOME: root, XDG_STATE_HOME: join(root, "state"), PATH: `${join(root, "bin")}:/usr/bin:/bin` },
+    });
+    chmodSync(join(root, ".config", "opencode"), 0o755);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain("rolled back from");
+    expect(readFileSync(join(root, "dotfiles", "config.toml"), "utf8")).toBe('model = "o3"\n');
+    expect(readlinkSync(join(root, ".codex", "config.toml"))).toBe("../dotfiles/config.toml");
+  });
+
+  test("refuses to write through a dangling symlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const link = join(root, "mcp.json");
+    symlinkSync(join(root, "missing.json"), link);
+    expect(() => renderDirectTarget("pi", link, { demo: { command: "npx" } })).toThrow("dangling symlink");
+  });
+
   test("renders Pi without losing unknown fields or unrelated servers", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);
@@ -922,6 +1006,63 @@ describe("MCP provenance", () => {
     expect(manifest.servers["context-mode"].conflict).toBeFalse();
     expect(codexInstall.indirection).toEqual({ harness: "pi", server: "context-mode", path: pi });
     expect(codexInstall.effectiveConfigHash).not.toBe(codexInstall.configHash);
+    expect(JSON.stringify(manifest)).not.toContain("secret");
+  });
+
+  test("resolves Grok agent-mcp-from-pi wrappers like Codex and reports missing references", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const pi = join(root, "mcp.json");
+    const grok = join(root, "grok.toml");
+    const claude = join(root, "claude.json");
+    writeFileSync(pi, JSON.stringify({ mcpServers: { shadcn: { command: "npx", args: ["shadcn@latest", "mcp"] } } }));
+    writeFileSync(claude, JSON.stringify({ mcpServers: { shadcn: { command: "npx", args: ["shadcn@latest", "mcp"] } } }));
+    writeFileSync(grok, '[mcp_servers.shadcn]\ncommand = "/home/test/.codex/bin/agent-mcp-from-pi"\nargs = ["shadcn"]\n\n[mcp_servers.typo]\ncommand = "/home/test/.codex/bin/agent-mcp-from-pi"\nargs = ["typo"]\n');
+    const sources = [
+      { harness: "grok", path: grok, scope: "global" as const },
+      { harness: "pi", path: pi, scope: "global" as const },
+      { harness: "claude", path: claude, scope: "global" as const },
+    ];
+    expect(scanMcpManifest(sources, { version: 1, servers: {} }, "now").servers.shadcn.conflict).toBeFalse();
+    expect(inspectMcpConfigurations(sources, "linux")).toContainEqual(expect.objectContaining({ issue: "missing-pi-server", harness: "grok", server: "typo" }));
+  });
+
+  test("resolves launcher bindings, including Pi's, against the shared global catalog", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const catalog = join(root, "catalog.json");
+    const pi = join(root, "pi.json");
+    const claude = join(root, "claude.json");
+    writeFileSync(catalog, JSON.stringify({ mcpServers: { demo: { command: "npx", args: ["demo"], env: { TOKEN: "secret" } } } }));
+    writeFileSync(pi, JSON.stringify({ mcpServers: { demo: { command: "/home/test/.codex/bin/agent-mcp-from-pi", args: ["demo"] }, gone: { command: "/home/test/.codex/bin/agent-mcp-from-pi", args: ["gone"] } } }));
+    writeFileSync(claude, JSON.stringify({ mcpServers: { demo: { command: "/Users/test/.codex/bin/agent-mcp-from-pi", args: ["demo"] } } }));
+    const sources = [
+      { harness: "catalog", path: catalog, scope: "global" as const },
+      { harness: "pi", path: pi, scope: "global" as const },
+      { harness: "claude", path: claude, scope: "global" as const },
+    ];
+    const manifest = scanMcpManifest(sources, { version: 1, servers: {} }, "now");
+    expect(manifest.servers.demo.conflict).toBeFalse();
+    expect(manifest.servers.demo.installations.find((item) => item.harness === "pi")?.indirection).toEqual({ harness: "catalog", server: "demo", path: catalog });
+    expect(inspectMcpConfigurations(sources, "linux")).toContainEqual(expect.objectContaining({ issue: "missing-pi-server", harness: "pi", server: "gone" }));
+    expect(JSON.stringify(manifest)).not.toContain("secret");
+  });
+
+  test("resolves agent-mcp-from-pi wrappers in Claude and OpenCode configs", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const pi = join(root, "mcp.json");
+    const claude = join(root, "claude.json");
+    const opencode = join(root, "opencode.json");
+    writeFileSync(pi, JSON.stringify({ mcpServers: { demo: { command: "npx", args: ["demo"], env: { TOKEN: "secret" } } } }));
+    writeFileSync(claude, JSON.stringify({ mcpServers: { demo: { command: "/Users/test/.codex/bin/agent-mcp-from-pi", args: ["demo"] } } }));
+    writeFileSync(opencode, JSON.stringify({ mcp: { demo: { type: "local", command: ["/home/test/.codex/bin/agent-mcp-from-pi", "demo"], enabled: true } } }));
+    const manifest = scanMcpManifest([
+      { harness: "claude", path: claude, scope: "global" },
+      { harness: "opencode", path: opencode, scope: "global" },
+      { harness: "pi", path: pi, scope: "global" },
+    ], { version: 1, servers: {} }, "now");
+    expect(manifest.servers.demo.conflict).toBeFalse();
     expect(JSON.stringify(manifest)).not.toContain("secret");
   });
 

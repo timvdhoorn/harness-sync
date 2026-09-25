@@ -82,7 +82,7 @@ export type McpInstallation = {
   scope: "project" | "global";
   configHash: string;
   effectiveConfigHash?: string;
-  indirection?: { harness: "pi"; server: string; path: string };
+  indirection?: { harness: "pi" | "catalog"; server: string; path: string };
 };
 export type McpAuditIssue = {
   issue: "non-portable-path" | "harness-coupled-launcher" | "missing-pi-server" | "app-owned-harness" | "app-owned-platform";
@@ -217,23 +217,41 @@ function readJson(path: string): any {
 }
 
 function writeJsonAtomic(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.harness-sync-${process.pid}`;
-  writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temp, path);
-  chmodSync(path, 0o600);
+  writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function writeTextAtomic(path: string, value: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.harness-sync-${process.pid}`;
+  const destination = writeDestination(path);
+  mkdirSync(dirname(destination), { recursive: true });
+  const temp = `${destination}.harness-sync-${process.pid}`;
   writeFileSync(temp, value, { mode: 0o600 });
-  renameSync(temp, path);
-  chmodSync(path, 0o600);
+  renameSync(temp, destination);
+  chmodSync(destination, 0o600);
+}
+
+function writeDestination(path: string): string {
+  if (!pathExists(path) || !lstatSync(path).isSymbolicLink()) return path;
+  try {
+    return realpathSync(path);
+  } catch {
+    throw new Error(`refusing to replace dangling symlink: ${path}`);
+  }
 }
 
 function timestamp(): string {
   return new Date().toISOString().replaceAll(":", "-");
+}
+
+function backupSources(paths: string[]): string[] {
+  const sources: string[] = [];
+  for (const path of new Set(paths)) {
+    sources.push(path);
+    if (!pathExists(path) || !lstatSync(path).isSymbolicLink()) continue;
+    try {
+      sources.push(realpathSync(path));
+    } catch { /* a dangling link has no target to preserve */ }
+  }
+  return [...new Set(sources)];
 }
 
 function backup(paths: string[]): string {
@@ -241,15 +259,15 @@ function backup(paths: string[]): string {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
   const manifest: Array<{ source: string; backup?: string; kind: "file" | "directory" | "symlink" | "missing" }> = [];
-  for (const source of [...new Set(paths)]) {
-    if (!existsSync(source)) {
+  for (const source of backupSources(paths)) {
+    if (!pathExists(source)) {
       manifest.push({ source, kind: "missing" });
       continue;
     }
     const target = join(root, createHash("sha256").update(source).digest("hex").slice(0, 16));
     const info = lstatSync(source);
     const kind = info.isSymbolicLink() ? "symlink" : info.isDirectory() ? "directory" : "file";
-    cpSync(source, target, { recursive: true, dereference: false });
+    cpSync(source, target, { recursive: true, dereference: false, verbatimSymlinks: true });
     manifest.push({ source, backup: target, kind });
   }
   writeJsonAtomic(join(root, "manifest.json"), manifest);
@@ -260,18 +278,42 @@ function restoreBackup(root: string): void {
   const manifestPath = join(root, "manifest.json");
   if (!existsSync(manifestPath)) return;
   const manifest = readJson(manifestPath) as Array<{ source: string; backup?: string; kind: string }>;
+  const failed: string[] = [];
   for (const item of manifest.reverse()) {
-    if (existsSync(item.source)) rmSync(item.source, { recursive: true, force: true });
-    if (item.kind === "missing" || !item.backup) continue;
-    mkdirSync(dirname(item.source), { recursive: true });
-    cpSync(item.backup, item.source, { recursive: true, dereference: false });
+    try {
+      if (item.kind === "file" && item.backup && pathExists(item.source) && lstatSync(item.source).isFile() && hashFile(item.source) === hashFile(item.backup)) continue;
+      if (pathExists(item.source)) rmSync(item.source, { recursive: true, force: true });
+      if (item.kind === "missing" || !item.backup) continue;
+      mkdirSync(dirname(item.source), { recursive: true });
+      cpSync(item.backup, item.source, { recursive: true, dereference: false, verbatimSymlinks: true });
+    } catch (error) {
+      failed.push(`${item.source} (${(error as Error).message})`);
+    }
   }
+  if (failed.length) throw new Error(`could not restore ${failed.join("; ")}`);
+}
+
+function withBackup(label: string, paths: string[], action: () => void): string {
+  const root = backup(paths);
+  try {
+    action();
+  } catch (error) {
+    const reason = (error as Error).message;
+    try {
+      restoreBackup(root);
+    } catch (restoreError) {
+      throw new Error(`${label} failed and rollback from ${root} also failed (${(restoreError as Error).message}): ${reason}`);
+    }
+    throw new Error(`${label} failed; rolled back from ${root}: ${reason}`);
+  }
+  cleanOldBackups();
+  return root;
 }
 
 function cleanOldBackups(): void {
   const root = join(stateRoot, "backups");
   if (!existsSync(root)) return;
-  const entries = readdirSync(root).sort().reverse();
+  const entries = readdirSync(root).filter((name) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z$/.test(name)).sort().reverse();
   for (const stale of entries.slice(10)) rmSync(join(root, stale), { recursive: true, force: true });
 }
 
@@ -542,6 +584,18 @@ function mcpInventory(path: string): string[] {
   try { return Object.keys(normalizeMcpFile(path)); } catch { return []; }
 }
 
+const sharedCatalogPath = join(home, ".agents", "mcp", "mcp.json");
+
+// Launcher bindings resolve to the shared catalog when present, otherwise to the global Pi config.
+function launcherSource<T extends { source: McpSource }>(loaded: T[]): T | undefined {
+  return loaded.find((item) => item.source.harness === "catalog" && item.source.scope === "global")
+    ?? loaded.find((item) => item.source.harness === "pi" && item.source.scope === "global");
+}
+
+function resolvesLauncher(harness: string): boolean {
+  return harness !== "catalog" && (harness !== "pi" || existsSync(sharedCatalogPath));
+}
+
 export function piServerReference(server: McpServer): string | undefined {
   if (!server.command || basename(server.command) !== "agent-mcp-from-pi") return undefined;
   if (server.url || server.args?.length !== 1 || !server.args[0]) return undefined;
@@ -603,11 +657,11 @@ export function inspectMcpConfigurations(
     if (!existsSync(source.path)) return [];
     try { return [{ source, servers: normalizeMcpFile(source.path) }]; } catch { return []; }
   });
-  const pi = loaded.find((item) => item.source.harness === "pi" && item.source.scope === "global");
+  const pi = launcherSource(loaded);
   const dependents = new Map<string, string[]>();
   const issues: McpAuditIssue[] = [];
 
-  for (const item of loaded.filter((entry) => entry.source.harness === "codex")) {
+  for (const item of loaded.filter((entry) => entry !== pi)) {
     for (const [name, server] of Object.entries(item.servers)) {
       const reference = piServerReference(server);
       if (!reference) continue;
@@ -916,19 +970,14 @@ function syncInstructions(args: string[]): void {
   console.log(`Plan: link ${changes.length} CLAUDE.md path(s) to AGENTS.md`);
   if (!apply) return;
   if (conflicts.length && !args.includes("--replace")) fail(`existing CLAUDE.md requires explicit --replace: ${conflicts.map((item) => item.claude).join(", ")}`);
-  const backupRoot = backup(changes.map((item) => item.claude));
-  try {
+  const backupRoot = withBackup("instruction sync", changes.map((item) => item.claude), () => {
     for (const item of changes) {
       if (pathExists(item.claude)) rmSync(item.claude, { recursive: true, force: true });
       mkdirSync(dirname(item.claude), { recursive: true });
       symlinkSync(relative(dirname(item.claude), item.agents), item.claude);
     }
-    cleanOldBackups();
-    console.log(`Applied ${changes.length} instruction link(s). Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`instruction sync failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Applied ${changes.length} instruction link(s). Backup: ${backupRoot}`);
 }
 
 function strictSkillIssueCode(issue: string, canonical: boolean): string | undefined {
@@ -1048,7 +1097,7 @@ function audit(asJson: boolean, strict = false): void {
     console.log(`MCP provenance: ${mcpProvenance.exists ? "initialized" : "missing"}; servers=${mcpProvenance.servers}; known=${mcpProvenance.known}; unknown=${mcpProvenance.unknown}; conflicts=${mcpProvenance.conflicts.length}`);
     for (const item of mcpIssues) {
       if (item.issue === "missing-pi-server") {
-        console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} references missing Pi server in ${item.targetPath}; indirect harnesses=${item.indirectHarnesses.join(", ")}`);
+        console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} references a server missing from ${item.targetPath}; indirect harnesses=${item.indirectHarnesses.join(", ")}`);
       } else if (item.issue === "harness-coupled-launcher") {
         console.log(`MCP indirection: ${item.path}: ${item.server} ${item.field}=${item.value} depends on a harness-specific launcher`);
       } else if (item.issue === "app-owned-harness") {
@@ -1107,6 +1156,35 @@ function applyRequired(args: string[]): boolean {
   return apply;
 }
 
+const commandFlags: Record<string, { switches: string[]; values: string[] }> = {
+  audit: { switches: ["--json", "--strict"], values: [] },
+  doctor: { switches: ["--json", "--strict"], values: [] },
+  "portable-config register": { switches: ["--apply", "--confirmed", "--replace-source"], values: ["--id", "--source", "--target", "--seed-from", "--format"] },
+  "portable-config render": { switches: ["--apply", "--confirmed"], values: ["--id"] },
+  init: { switches: ["--apply", "--confirmed"], values: [] },
+  instructions: { switches: ["--apply", "--confirmed", "--replace"], values: ["--scope"] },
+  add: { switches: ["--apply", "--confirmed", "--full-depth"], values: ["--skill"] },
+  remove: { switches: ["--apply", "--confirmed"], values: [] },
+  update: { switches: ["--apply", "--confirmed"], values: [] },
+  mcp: { switches: ["--apply", "--confirmed", "--direct", "--non-interactive"], values: ["--from", "--target", "--scope", "--server", "--resolve"] },
+  "mcp-remove": { switches: ["--apply", "--confirmed"], values: ["--server", "--target", "--scope"] },
+};
+
+export function assertKnownFlags(command: string, args: string[]): void {
+  const allowed = commandFlags[command];
+  if (!allowed) return;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (allowed.values.includes(arg)) {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("--")) fail(`${arg} requires a value`);
+      index++;
+    } else if (arg.startsWith("-") && !allowed.switches.includes(arg)) {
+      fail(`unknown option for ${command}: ${arg}`);
+    }
+  }
+}
+
 function argumentValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
@@ -1127,7 +1205,7 @@ function portableConfigRegister(args: string[]): void {
   const seed = resolvePortablePath(seedValue ?? targetValue);
   if (source === target) fail("portable source and rendered target must be different paths");
   if (!existsSync(seed) && !existsSync(source)) fail(`portable source seed is missing: ${seed}`);
-  const candidate = existsSync(source) ? source : seed;
+  const candidate = existsSync(source) && !args.includes("--replace-source") ? source : seed;
   if (format === "json") {
     try { readJson(candidate); } catch { fail(`portable source is not valid JSON: ${candidate}`); }
     const hookIssues = inspectHookConfiguration(candidate, { shared: true });
@@ -1157,8 +1235,7 @@ function portableConfigRegister(args: string[]): void {
   if (existsSync(source) && sourceWillChange && !args.includes("--replace-source")) fail(`portable source exists with different content; review and pass --replace-source: ${source}`);
   const syncedRoot = findSyncthingRoot(target);
   const ignore = syncedRoot ? join(syncedRoot, ".stignore") : undefined;
-  const backupRoot = backup([portableConfigManifestPath, source, ...(ignore ? [ignore] : [])]);
-  try {
+  const backupRoot = withBackup("portable config registration", [portableConfigManifestPath, source, ...(ignore ? [ignore] : [])], () => {
     if (sourceWillChange) {
       mkdirSync(dirname(source), { recursive: true });
       cpSync(seed, source);
@@ -1167,12 +1244,8 @@ function portableConfigRegister(args: string[]): void {
     manifest.configs[id] = entry;
     writeJsonAtomic(portableConfigManifestPath, manifest);
     ensureTargetIgnored(target);
-    cleanOldBackups();
-    console.log(`Registered portable config ${id}. Manifest: ${portableConfigManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`portable config registration failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Registered portable config ${id}. Manifest: ${portableConfigManifestPath}. Backup: ${backupRoot}`);
 }
 
 function portableConfigRender(args: string[]): void {
@@ -1204,8 +1277,7 @@ function portableConfigRender(args: string[]): void {
     const root = findSyncthingRoot(item.target);
     return [item.target, ...(root ? [join(root, ".stignore")] : [])];
   });
-  const backupRoot = backup(affected);
-  try {
+  const backupRoot = withBackup("portable config render", affected, () => {
     for (const item of operations) {
       ensureTargetIgnored(item.target);
       if (item.changed) {
@@ -1214,14 +1286,10 @@ function portableConfigRender(args: string[]): void {
       }
       chmodSync(item.target, 0o600);
     }
-    const remaining = inspectPortableConfigs(manifest);
+    const remaining = inspectPortableConfigs({ ...manifest, configs: Object.fromEntries(entries) });
     if (remaining.length) throw new Error(`render left ${remaining.length} portable config issue(s)`);
-    cleanOldBackups();
-    console.log(`Rendered ${operations.length} portable config(s). Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`portable config render failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Rendered ${operations.length} portable config(s). Backup: ${backupRoot}`);
 }
 
 function portableConfigCommand(args: string[]): void {
@@ -1264,8 +1332,7 @@ function addSkill(args: string[]): void {
   console.log(`Plan: ${command.join(" ")}`);
   if (!apply) return;
   const before = currentSkillManifest();
-  const backupRoot = backup([canonicalSkills, ...harnesses.map((item) => item.skillDir), skillManifestPath]);
-  try {
+  const backupRoot = withBackup("add", skillMutationPaths(), () => {
     run(command);
     const after = scanSkillManifest(canonicalSkills, globalSkillLocks(), before);
     const selectedIndex = sourceArgs.indexOf("--skill");
@@ -1283,20 +1350,21 @@ function addSkill(args: string[]): void {
       }
     }
     writeJsonAtomic(skillManifestPath, after);
-    cleanOldBackups();
-    console.log(`Applied. Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`add failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Applied. Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
+}
+
+function skillMutationPaths(): string[] {
+  return [...globalSkillLocks(), canonicalSkills, ...harnesses.map((item) => item.skillDir), skillManifestPath];
 }
 
 function npxLockOwns(name: string): boolean {
   for (const path of globalSkillLocks()) {
     if (!existsSync(path)) continue;
     try {
-      const text = readFileSync(path, "utf8");
-      if (text.includes(`\"${name}\"`)) return true;
+      const lock = readJson(path);
+      const skills = lock?.skills && typeof lock.skills === "object" ? lock.skills : lock;
+      if (skills && typeof skills === "object" && Object.hasOwn(skills, name)) return true;
     } catch { /* audit reports malformed files separately */ }
   }
   return false;
@@ -1317,19 +1385,14 @@ function removeSkill(name: string, args: string[]): void {
   if (!targets.length) fail(`skill not found: ${name}`);
   console.log(`Plan: remove ${name} from ${targets.length} path(s):\n${targets.join("\n")}`);
   if (!apply) return;
-  const backupRoot = backup([...targets, ...globalSkillLocks(), skillManifestPath]);
-  try {
+  const backupRoot = withBackup("remove", [...targets, ...globalSkillLocks(), skillManifestPath], () => {
     if (npxLockOwns(name)) run(["npx", "--yes", "skills", "remove", name, "-g", "-y"]);
     for (const target of targets) removeExistingPath(target);
     const manifest = readSkillManifest();
     delete manifest.skills[name];
     writeJsonAtomic(skillManifestPath, manifest);
-    cleanOldBackups();
-    console.log(`Removed ${name}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`remove failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Removed ${name}. Backup: ${backupRoot}`);
 }
 
 function updateSkills(names: string[], args: string[]): void {
@@ -1342,13 +1405,13 @@ function updateSkills(names: string[], args: string[]): void {
   if (missing.length) fail(`skills not found in manifest; run init first: ${missing.join(", ")}`);
   const unknown = requested.filter((name) => !manifest.skills[name].source);
   const tracked = requested.filter((name) => manifest.skills[name].source);
-  for (const name of tracked) console.log(`Plan: update ${name} from ${skillInstallSource(manifest.skills[name])} (current ${manifest.skills[name].version})`);
+  console.log(`Plan: reinstall ${tracked.length} tracked skill(s) from recorded sources; upstream changes are not compared before apply`);
+  for (const name of tracked) console.log(`  ${name} from ${skillInstallSource(manifest.skills[name])} (current ${manifest.skills[name].version})`);
   if (unknown.length) console.log(`Skip (unknown source): ${unknown.join(", ")}`);
   if (cleanNames.length && unknown.length) fail(`cannot update skills with unknown source: ${unknown.join(", ")}`);
   if (!apply) return;
   const agents = detectedHarnesses().filter((item) => item.installed && item.npxAgent).map((item) => item.npxAgent!);
-  const backupRoot = backup([...globalSkillLocks(), canonicalSkills, skillManifestPath]);
-  try {
+  const backupRoot = withBackup("update", skillMutationPaths(), () => {
     for (const name of tracked) {
       const item = manifest.skills[name];
       run(["npx", "--yes", "skills", "add", skillInstallSource(item)!, "--skill", name, ...(item.fullDepth ? ["--full-depth"] : []), "-g", "-y", "--agent", ...agents]);
@@ -1357,10 +1420,8 @@ function updateSkills(names: string[], args: string[]): void {
     assertStandaloneSkills(tracked);
     for (const name of tracked) refreshed.skills[name].provenance = "install";
     writeJsonAtomic(skillManifestPath, refreshed);
-    cleanOldBackups();
-    console.log(`Applied ${tracked.length} update(s). Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
-  }
-  catch (error) { restoreBackup(backupRoot); throw new Error(`update failed; rolled back from ${backupRoot}: ${(error as Error).message}`); }
+  });
+  console.log(`Applied ${tracked.length} update(s). Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
 }
 
 function initState(args: string[]): void {
@@ -1374,16 +1435,11 @@ function initState(args: string[]): void {
   console.log(`Plan: inventory ${Object.keys(skillManifest.skills).length} canonical skill(s); known source=${knownSkills}; unknown source=${Object.keys(skillManifest.skills).length - knownSkills}`);
   console.log(`Plan: inventory ${Object.keys(mcpManifest.servers).length} MCP server(s); known upstream=${knownMcps}; unknown upstream=${Object.keys(mcpManifest.servers).length - knownMcps}; conflicts=${mcpConflicts}`);
   if (!apply) return;
-  const backupRoot = backup([skillManifestPath, mcpManifestPath]);
-  try {
+  const backupRoot = withBackup("init", [skillManifestPath, mcpManifestPath], () => {
     writeJsonAtomic(skillManifestPath, skillManifest);
     writeJsonAtomic(mcpManifestPath, mcpManifest);
-    cleanOldBackups();
-    console.log(`Initialized ${skillManifestPath} and ${mcpManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`init failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Initialized ${skillManifestPath} and ${mcpManifestPath}. Backup: ${backupRoot}`);
 }
 
 function hasSecretLiterals(servers: Record<string, McpServer>): boolean {
@@ -1410,6 +1466,7 @@ function mcpSources(): McpSource[] {
     { harness: "opencode", path: join(root, ".opencode", "opencode.json"), scope: "project" },
     { harness: "gemini", path: join(root, ".gemini", "settings.json"), scope: "project" },
     { harness: "catalog", path: join(root, "mcp.json"), scope: "project" },
+    { harness: "catalog", path: sharedCatalogPath, scope: "global" },
     { harness: "pi", path: join(home, ".pi", "mcp", "mcp.json"), scope: "global" },
     { harness: "claude", path: join(home, ".claude.json"), scope: "global" },
     { harness: "codex", path: join(home, ".codex", "config.toml"), scope: "global" },
@@ -1432,7 +1489,7 @@ function mcpTargetPath(harness: string, scope: "project" | "global"): string | u
     pi: { global: join(home, ".pi", "mcp", "mcp.json") },
     hermes: { global: join(home, ".hermes", "config.yaml") },
     goose: { global: join(home, ".config", "goose", "config.yaml") },
-    catalog: { project: join(root, "mcp.json"), global: "" },
+    catalog: { project: join(root, "mcp.json"), global: sharedCatalogPath },
   };
   return paths[harness]?.[scope] || undefined;
 }
@@ -1462,24 +1519,90 @@ function codexServerBlock(name: string, server: McpServer, unknownRoot: string[]
   return text;
 }
 
+type TomlSection = { header?: string; arrayTable: boolean; statements: string[] };
+
+function tomlLineState(line: string, state: { depth: number; triple?: string }): { depth: number; triple?: string } {
+  let { depth, triple } = state;
+  let index = 0;
+  while (index < line.length) {
+    if (triple) {
+      const end = line.indexOf(triple, index);
+      if (end < 0) return { depth, triple };
+      index = end + 3;
+      triple = undefined;
+      continue;
+    }
+    const char = line[index];
+    if (char === "#") break;
+    if (line.startsWith('"""', index) || line.startsWith("'''", index)) {
+      triple = line.slice(index, index + 3);
+      index += 3;
+    } else if (char === '"') {
+      index++;
+      while (index < line.length && line[index] !== '"') index += line[index] === "\\" ? 2 : 1;
+      index++;
+    } else if (char === "'") {
+      const end = line.indexOf("'", index + 1);
+      index = end < 0 ? line.length : end + 1;
+    } else {
+      if (char === "[" || char === "{") depth++;
+      if (char === "]" || char === "}") depth--;
+      index++;
+    }
+  }
+  return { depth, triple };
+}
+
+function tomlStatements(text: string): string[] {
+  const statements: string[] = [];
+  let current: string[] = [];
+  let state: { depth: number; triple?: string } = { depth: 0 };
+  for (const line of text.split("\n")) {
+    current.push(line);
+    state = tomlLineState(line, state);
+    if (state.depth <= 0 && !state.triple) {
+      statements.push(current.join("\n"));
+      current = [];
+      state = { depth: 0 };
+    }
+  }
+  if (current.length) statements.push(current.join("\n"));
+  return statements;
+}
+
+function tomlSections(text: string): TomlSection[] {
+  const sections: TomlSection[] = [{ arrayTable: false, statements: [] }];
+  for (const statement of tomlStatements(text.trimEnd())) {
+    const header = statement.includes("\n") ? undefined : statement.trim().match(/^(\[\[?)\s*([^\[\]]+?)\s*\]\]?\s*(?:#.*)?$/);
+    if (header) sections.push({ header: header[2], arrayTable: header[1] === "[[", statements: [statement] });
+    else sections.at(-1)!.statements.push(statement);
+  }
+  return sections;
+}
+
+function tomlSectionText(section: TomlSection): string {
+  return section.statements.join("\n").trim();
+}
+
+function codexSectionServer(section: TomlSection): { server: string; field?: string } | undefined {
+  return section.header && !section.arrayTable ? codexSection(section.header) : undefined;
+}
+
 function updateCodexServer(text: string, name: string, server: McpServer): string {
-  const sections = text.trimEnd().split(/(?=^\s*\[[^\]]+\]\s*$)/m);
   const kept: string[] = [];
   const unknownRoot: string[] = [];
-  for (const section of sections) {
-    const lines = section.trim().split("\n");
-    const header = lines[0]?.trim().match(/^\[([^\]]+)\]$/)?.[1];
-    const parsed = header ? codexSection(header) : undefined;
+  for (const section of tomlSections(text)) {
+    const parsed = codexSectionServer(section);
     if (parsed?.server !== name) {
-      if (section.trim()) kept.push(section.trim());
+      if (tomlSectionText(section)) kept.push(tomlSectionText(section));
       continue;
     }
     if (parsed.field === "env" || parsed.field === "http_headers") continue;
     if (!parsed.field) {
-      unknownRoot.push(...lines.slice(1).filter((line) => !/^\s*(?:command|args|cwd|url|enabled)\s*=/.test(line)));
+      unknownRoot.push(...section.statements.slice(1).filter((statement) => statement.trim() && !/^\s*(?:command|args|cwd|url|enabled|env|http_headers)\s*=/.test(statement)));
       continue;
     }
-    kept.push(section.trim());
+    kept.push(tomlSectionText(section));
   }
   kept.push(codexServerBlock(name, server, unknownRoot));
   return `${kept.filter(Boolean).join("\n\n")}\n`;
@@ -1492,14 +1615,11 @@ function renderCodex(path: string, servers: Record<string, McpServer>): void {
 }
 
 function removeCodexServers(path: string, names: Set<string>): void {
-  const text = readFileSync(path, "utf8");
-  const sections = text.trimEnd().split(/(?=^\s*\[[^\]]+\]\s*$)/m);
-  const kept = sections.filter((section) => {
-    const header = section.trim().split("\n")[0]?.trim().match(/^\[([^\]]+)\]$/)?.[1];
-    const parsed = header ? codexSection(header) : undefined;
+  const kept = tomlSections(readFileSync(path, "utf8")).filter((section) => {
+    const parsed = codexSectionServer(section);
     return !parsed || !names.has(parsed.server);
   });
-  writeTextAtomic(path, `${kept.map((section) => section.trim()).filter(Boolean).join("\n\n")}\n`);
+  writeTextAtomic(path, `${kept.map(tomlSectionText).filter(Boolean).join("\n\n")}\n`);
 }
 
 function preserveUnknown(existing: unknown, known: string[]): Record<string, unknown> {
@@ -1554,16 +1674,76 @@ function renderYamlTarget(path: string, harness: "hermes" | "goose", servers: Re
   writeTextAtomic(path, Bun.YAML.stringify(yaml));
 }
 
+function parseDirectTarget(harness: string, path: string): any {
+  const text = readFileSync(path, "utf8");
+  if (harness === "codex") return Bun.TOML.parse(text);
+  if (harness === "hermes" || harness === "goose") return Bun.YAML.parse(text) ?? {};
+  return path.endsWith(".jsonc") ? Bun.JSONC.parse(text) : JSON.parse(text);
+}
+
+function directServerContainer(harness: string, document: any): Record<string, unknown> | undefined {
+  const object = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  if (harness === "codex" || harness === "hermes") return object(document?.mcp_servers);
+  if (harness === "goose") return object(document?.extensions);
+  if (harness === "opencode") return object(document?.mcp?.servers) ?? object(document?.mcp);
+  return object(document?.mcpServers) ?? object(document?.mcp?.servers) ?? object(document?.mcp);
+}
+
+function withoutServers(harness: string, document: any, names: string[]): string {
+  const copy = structuredClone(document ?? {});
+  const container = directServerContainer(harness, copy);
+  if (container) for (const name of names) delete container[name];
+  const prune = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(prune);
+    if (!value || typeof value !== "object") return value;
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, prune(item)] as const)
+      .filter(([, item]) => !(item && typeof item === "object" && !Array.isArray(item) && !Object.keys(item).length))
+      .sort(([left], [right]) => left.localeCompare(right));
+    return Object.fromEntries(entries);
+  };
+  return JSON.stringify(prune(copy));
+}
+
+function verifiedDirectWrite(harness: string, path: string, names: string[], present: boolean, write: () => void): void {
+  const original = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+  const before = original === undefined ? undefined : parseDirectTarget(harness, path);
+  write();
+  try {
+    let after: any;
+    try {
+      after = parseDirectTarget(harness, path);
+    } catch (error) {
+      throw new Error(`rendered ${harness} config is not valid: ${(error as Error).message}`);
+    }
+    const container = directServerContainer(harness, after) ?? {};
+    const wrong = names.filter((name) => (name in container) !== present);
+    if (wrong.length) throw new Error(`rendered ${harness} config has unexpected server state: ${wrong.join(", ")}`);
+    if (before !== undefined && withoutServers(harness, before, names) !== withoutServers(harness, after, names)) {
+      throw new Error(`rendered ${harness} config changed settings outside the selected servers`);
+    }
+  } catch (error) {
+    if (original === undefined) rmSync(writeDestination(path), { force: true });
+    else writeTextAtomic(path, original);
+    throw new Error(`${(error as Error).message}; ${path} left unchanged`);
+  }
+}
+
 export function renderDirectTarget(harness: string, path: string, servers: Record<string, McpServer>): void {
-  if (harness === "codex") return renderCodex(path, servers);
-  if (harness === "pi" || harness === "catalog") return renderPi(path, servers);
-  if (harness === "opencode") return renderOpenCode(path, servers);
-  if (harness === "hermes" || harness === "goose") return renderYamlTarget(path, harness, servers);
+  const names = Object.keys(servers);
+  if (harness === "codex") return verifiedDirectWrite(harness, path, names, true, () => renderCodex(path, servers));
+  if (harness === "pi" || harness === "catalog") return verifiedDirectWrite(harness, path, names, true, () => renderPi(path, servers));
+  if (harness === "opencode") return verifiedDirectWrite(harness, path, names, true, () => renderOpenCode(path, servers));
+  if (harness === "hermes" || harness === "goose") return verifiedDirectWrite(harness, path, names, true, () => renderYamlTarget(path, harness, servers));
   fail(`no direct MCP renderer for ${harness}`);
 }
 
 export function removeDirectMcpServers(harness: string, path: string, serverNames: string[]): void {
   if (!existsSync(path)) return;
+  verifiedDirectWrite(harness, path, serverNames, false, () => removeDirectMcpServersUnchecked(harness, path, serverNames));
+}
+
+function removeDirectMcpServersUnchecked(harness: string, path: string, serverNames: string[]): void {
   const names = new Set(serverNames);
   if (harness === "codex") return removeCodexServers(path, names);
   if (harness === "pi" || harness === "catalog") {
@@ -1663,11 +1843,12 @@ export function scanMcpManifest(
     if (!existsSync(source.path)) return [];
     try { return [{ source, servers: normalizeMcpFile(source.path) }]; } catch { return []; }
   });
-  const pi = loaded.find((item) => item.source.harness === "pi" && item.source.scope === "global");
+  const pi = launcherSource(loaded);
   const found = new Map<string, Array<{ server: McpServer; installation: McpInstallation }>>();
-  for (const { source, servers } of loaded) {
+  for (const item of loaded) {
+    const { source, servers } = item;
     for (const [name, rawServer] of Object.entries(servers)) {
-      const reference = source.harness === "codex" ? piServerReference(rawServer) : undefined;
+      const reference = item !== pi ? piServerReference(rawServer) : undefined;
       const effectiveServer = reference && pi?.servers[reference] ? pi.servers[reference] : rawServer;
       const entries = found.get(name) ?? [];
       entries.push({
@@ -1679,7 +1860,7 @@ export function scanMcpManifest(
           configHash: mcpConfigHash(rawServer),
           ...(effectiveServer !== rawServer ? {
             effectiveConfigHash: mcpConfigHash(effectiveServer),
-            indirection: { harness: "pi", server: reference!, path: pi!.source.path },
+            indirection: { harness: pi!.source.harness as "pi" | "catalog", server: reference!, path: pi!.source.path },
           } : {}),
         },
       });
@@ -1719,8 +1900,8 @@ export function sameMcpServer(left: McpServer, right: McpServer): boolean {
 }
 
 function effectiveMcpServers(harness: string, servers: Record<string, McpServer>): Record<string, McpServer> {
-  if (harness !== "codex") return servers;
-  const piPath = mcpTargetPath("pi", "global");
+  if (!resolvesLauncher(harness)) return servers;
+  const piPath = existsSync(sharedCatalogPath) ? sharedCatalogPath : mcpTargetPath("pi", "global");
   if (!piPath || !existsSync(piPath)) return servers;
   let piServers: Record<string, McpServer>;
   try { piServers = normalizeMcpFile(piPath); } catch { return servers; }
@@ -1956,36 +2137,42 @@ export function buildMcpSyncPlan(
   return { plan, definitions };
 }
 
+const supportedMcpTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
+const directTargets = new Set(["codex", "pi", "opencode", "hermes", "goose", "catalog"]);
+
+function resolveMcpTargets(requested: string[]): string[] {
+  const detected = detectedHarnesses();
+  const targetNames = requested.length
+    ? [...new Set(requested)]
+    : detected.filter((item) => item.installed && supportedMcpTargets.includes(item.id)).map((item) => item.id);
+  for (const target of targetNames) {
+    if (!supportedMcpTargets.includes(target)) fail(`unsupported MCP target: ${target}`);
+    if (!directTargets.has(target) && !detected.some((item) => item.id === target && item.installed)) fail(`MCP target not installed: ${target}`);
+  }
+  return targetNames;
+}
+
 function mcpSync(args: string[]): void {
   const apply = applyRequired(args);
   const valueAfter = (flag: string, fallback: string) => { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : fallback; };
   const valuesAfter = (flag: string) => args.flatMap((arg, index) => arg === flag && args[index + 1] ? [args[index + 1]] : []);
   const from = valueAfter("--from", "auto");
   const scope = valueAfter("--scope", "auto");
+  if (!["auto", "project", "global"].includes(scope)) fail("--scope must be auto, project, or global");
   const source = sourceForMcp(from, scope);
   const effectiveScope = scope === "auto" ? source.scope : scope;
   const requestedServer = valueAfter("--server", "");
   const allServers = effectiveMcpServers(source.harness, normalizeMcpFile(source.path));
   const servers = requestedServer ? Object.fromEntries(Object.entries(allServers).filter(([name]) => name === requestedServer)) : allServers;
   if (requestedServer && !Object.keys(servers).length) fail(`MCP server not found in source: ${requestedServer}`);
-  const requestedTargets = valuesAfter("--target");
-  const supportedTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
-  const directTargets = new Set(["codex", "pi", "opencode", "hermes", "goose", "catalog"]);
-  const detected = detectedHarnesses();
-  const targetNames = requestedTargets.length
-    ? [...new Set(requestedTargets)]
-    : detected.filter((item) => item.installed && supportedTargets.includes(item.id)).map((item) => item.id);
-  for (const target of targetNames) {
-    if (!supportedTargets.includes(target)) fail(`unsupported MCP target: ${target}`);
-    if (target !== "catalog" && !directTargets.has(target) && !detected.some((item) => item.id === target && item.installed)) fail(`MCP target not installed: ${target}`);
-  }
+  const targetNames = resolveMcpTargets(valuesAfter("--target"));
   const unsupported = targetNames.filter((target) => !mcpTargetPath(target, effectiveScope)).map((target) => `${target}:${effectiveScope}`);
   const replaceWrappers = args.includes("--direct");
   const targets: McpTargetBinding[] = targetNames.flatMap((harness) => {
     const path = mcpTargetPath(harness, effectiveScope as "project" | "global");
     if (!path) return [];
     const raw = existsSync(path) ? normalizeMcpFile(path) : {};
-    const effective = harness === "codex" ? effectiveMcpServers(harness, raw) : raw;
+    const effective = effectiveMcpServers(harness, raw);
     const managedWrappers = replaceWrappers && harness === "codex"
       ? Object.entries(raw).filter(([, server]) => piServerReference(server)).map(([name]) => name)
       : [];
@@ -2039,9 +2226,8 @@ function mcpSync(args: string[]): void {
     const unsafe = targetPaths.filter((path) => !gitIgnored(path));
     if (unsafe.length) fail(`secret-bearing project configs must be gitignored: ${unsafe.join(", ")}`);
   }
-  const backupRoot = backup([...targetPaths, mcpManifestPath]);
-  try {
-    for (const harness of ["codex", "pi", "opencode", "hermes", "goose", "catalog"]) {
+  const backupRoot = withBackup("MCP sync", [...targetPaths, mcpManifestPath], () => {
+    for (const harness of directTargets) {
       const target = targets.find((item) => item.harness === harness);
       const selected = Object.fromEntries(built.plan.operations.filter((operation) => operation.targets.some((item) => item.binding === (target ? bindingId(target) : ""))).map((operation) => [operation.server, built.definitions[operation.server]]));
       const path = target?.path;
@@ -2052,17 +2238,13 @@ function mcpSync(args: string[]): void {
       if (directTargets.has(target.harness)) continue;
       const server = built.definitions[operation.server];
       if (["claude", "grok", "gemini"].includes(target.harness)) {
-        run(mcpNativeCliCommand(target.harness as "claude" | "grok" | "gemini", effectiveScope as "project" | "global", operation.server, server));
+        run(mcpNativeCliCommand(target.harness as "claude" | "grok" | "gemini", effectiveScope as "project" | "global", operation.server, server), { cwd: projectRoot() });
         if (existsSync(target.path)) chmodSync(target.path, 0o600);
       }
     }
     writeJsonAtomic(mcpManifestPath, scanMcpManifest(mcpSources(), readMcpManifest()));
-    cleanOldBackups();
-    console.log(`Applied ${built.plan.operations.reduce((count, operation) => count + operation.targets.length, 0)} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`MCP sync failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Applied ${built.plan.operations.reduce((count, operation) => count + operation.targets.length, 0)} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
 }
 
 function mcpRemove(args: string[]): void {
@@ -2075,17 +2257,7 @@ function mcpRemove(args: string[]): void {
   if (!serverNames.length) fail("mcp-remove requires at least one --server <name>");
   if (serverNames.some((name) => name.startsWith("-") || /[\0\r\n]/.test(name))) fail("invalid MCP server name");
 
-  const requestedTargets = valuesAfter("--target");
-  const supportedTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
-  const directTargets = new Set(["codex", "pi", "opencode", "hermes", "goose", "catalog"]);
-  const detected = detectedHarnesses();
-  const targetNames = requestedTargets.length
-    ? [...new Set(requestedTargets)]
-    : detected.filter((item) => item.installed && supportedTargets.includes(item.id)).map((item) => item.id);
-  for (const target of targetNames) {
-    if (!supportedTargets.includes(target)) fail(`unsupported MCP target: ${target}`);
-    if (target !== "catalog" && !directTargets.has(target) && !detected.some((item) => item.id === target && item.installed)) fail(`MCP target not installed: ${target}`);
-  }
+  const targetNames = resolveMcpTargets(valuesAfter("--target"));
   const unsupported = targetNames.filter((target) => !mcpTargetPath(target, scope)).map((target) => `${target}:${scope}`);
   const targets: McpTargetBinding[] = targetNames.flatMap((harness) => {
     const path = mcpTargetPath(harness, scope);
@@ -2102,25 +2274,20 @@ function mcpRemove(args: string[]): void {
   if (!plan.operations.length) return;
 
   const targetPaths = [...new Set(plan.operations.flatMap((operation) => operation.targets.map((target) => target.path)))];
-  const backupRoot = backup([...targetPaths, mcpManifestPath]);
-  try {
+  const count = plan.operations.reduce((total, operation) => total + operation.targets.length, 0);
+  const backupRoot = withBackup("MCP removal", [...targetPaths, mcpManifestPath], () => {
     for (const target of targets) {
       const selected = plan.operations.filter((operation) => operation.targets.some((item) => item.binding === bindingId(target))).map((operation) => operation.server);
       if (!selected.length) continue;
       if (directTargets.has(target.harness)) removeDirectMcpServers(target.harness, target.path, selected);
       else for (const name of selected) {
-        run(mcpNativeCliRemoveCommand(target.harness as "claude" | "grok" | "gemini", scope, name));
+        run(mcpNativeCliRemoveCommand(target.harness as "claude" | "grok" | "gemini", scope, name), { cwd: projectRoot() });
         if (existsSync(target.path)) chmodSync(target.path, 0o600);
       }
     }
     writeJsonAtomic(mcpManifestPath, scanMcpManifest(mcpSources(), readMcpManifest()));
-    cleanOldBackups();
-    const count = plan.operations.reduce((total, operation) => total + operation.targets.length, 0);
-    console.log(`Removed ${count} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`MCP removal failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Removed ${count} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
 }
 
 function usage(): void {
@@ -2154,7 +2321,10 @@ Run a mutation command without --apply for a plan. Writes require --apply --conf
 export function main(argv = process.argv.slice(2)): void {
   const [command, ...args] = argv;
   try {
-    if (!command || command === "--help" || command === "-h") return usage();
+    if (!command || argv.includes("--help") || argv.includes("-h")) return usage();
+    const flagScope = command === "portable-config" ? `${command} ${args[0] ?? ""}` : command;
+    const addSourceIsCommand = command === "add" && (args[0] === "npx" || args[0]?.includes(" "));
+    if (!addSourceIsCommand) assertKnownFlags(flagScope, command === "portable-config" ? args.slice(1) : args);
     if (command === "audit") return audit(args.includes("--json"), args.includes("--strict"));
     if (command === "doctor") return doctor(args.includes("--json"), args.includes("--strict"));
     if (command === "portable-config") return portableConfigCommand(args);

@@ -197,6 +197,8 @@ Run another audit after every apply.
 | Command | Purpose |
 | --- | --- |
 | `audit` | Find broken skill links, copied or drifted skills, instruction-file problems, MCP conflicts, indirect launchers, and portability issues. |
+| `doctor` | Compare secret-free host state: harnesses, hook portability, and portable-config drift. |
+| `portable-config` | Register a Syncthing-shared source and render it to a machine-local target. |
 | `init` | Record the current skill and MCP inventory without guessing unknown sources. |
 | `instructions` | Make `AGENTS.md` canonical and link `CLAUDE.md` to it. |
 | `add` | Install a skill from a repository, URL, local path, `skills.sh` page, or approved `npx skills add` command. |
@@ -244,7 +246,8 @@ Preview instruction synchronization for the current project and user home:
 bun run scripts/harness-sync.ts instructions --scope all
 ```
 
-`AGENTS.md` is the canonical file. `CLAUDE.md` becomes a relative symlink to it.
+`AGENTS.md` is the canonical file. `CLAUDE.md` becomes a relative symlink to it;
+a real `CLAUDE.md` wrapper that imports `@AGENTS.md` is also accepted.
 An existing regular `CLAUDE.md` is treated as a conflict and is preserved until
 replacement is explicitly approved.
 
@@ -295,7 +298,7 @@ A same-name semantic difference is a conflict. Resolve each conflict explicitly:
 non-interactive mode exits with code 2 and performs no writes.
 
 Harness Sync also recognizes the optional
-`agent-mcp-from-pi <server-name>` launcher used by some Codex configurations. It
+`agent-mcp-from-pi <server-name>` launcher in any harness config. It
 can compare the effective Pi definition and, with `--direct`, replace a
 proven-equal wrapper with that direct definition. Other installations do not
 need this adapter.
@@ -304,10 +307,13 @@ need this adapter.
 
 - Dry runs have `apply: false` and an empty `writes` list.
 - Writes require both `--apply` and `--confirmed`.
-- Removal, overwrite, conflict resolution, and secret movement require separate
-  operator approval when the CLI is used through the skill.
+- Through the skill, removal, overwrite, conflict resolution, and secret movement
+  need operator approval; an approved batch covers its own writes.
 - Every affected path is backed up before mutation.
 - A failed apply restores the backup automatically.
+- Direct MCP renders are re-parsed after writing and reverted when they are
+  invalid or touch settings outside the selected servers.
+- Unknown options are rejected.
 - Plans and provenance never contain secret values.
 - A project MCP file with likely secret literals must already be gitignored.
 - Native configuration files are returned to mode `0600` after writes.
@@ -327,7 +333,9 @@ provided as a skill source.
 | Backups | `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/` |
 | Optional local MCP catalog | `./mcp.json` |
 
-State directories use mode `0700`; state files and backups use mode `0600`.
+State directories use mode `0700` and state files `0600`. Backup copies keep
+their source modes. The newest 10 timestamped backups are kept; manually named
+backup directories are left alone.
 
 ## Development
 
