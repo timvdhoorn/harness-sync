@@ -217,19 +217,25 @@ function readJson(path: string): any {
 }
 
 function writeJsonAtomic(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.harness-sync-${process.pid}`;
-  writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temp, path);
-  chmodSync(path, 0o600);
+  writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function writeTextAtomic(path: string, value: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.harness-sync-${process.pid}`;
+  const destination = writeDestination(path);
+  mkdirSync(dirname(destination), { recursive: true });
+  const temp = `${destination}.harness-sync-${process.pid}`;
   writeFileSync(temp, value, { mode: 0o600 });
-  renameSync(temp, path);
-  chmodSync(path, 0o600);
+  renameSync(temp, destination);
+  chmodSync(destination, 0o600);
+}
+
+function writeDestination(path: string): string {
+  if (!pathExists(path) || !lstatSync(path).isSymbolicLink()) return path;
+  try {
+    return realpathSync(path);
+  } catch {
+    throw new Error(`refusing to replace dangling symlink: ${path}`);
+  }
 }
 
 function timestamp(): string {
@@ -242,7 +248,7 @@ function backup(paths: string[]): string {
   chmodSync(root, 0o700);
   const manifest: Array<{ source: string; backup?: string; kind: "file" | "directory" | "symlink" | "missing" }> = [];
   for (const source of [...new Set(paths)]) {
-    if (!existsSync(source)) {
+    if (!pathExists(source)) {
       manifest.push({ source, kind: "missing" });
       continue;
     }
@@ -261,11 +267,28 @@ function restoreBackup(root: string): void {
   if (!existsSync(manifestPath)) return;
   const manifest = readJson(manifestPath) as Array<{ source: string; backup?: string; kind: string }>;
   for (const item of manifest.reverse()) {
-    if (existsSync(item.source)) rmSync(item.source, { recursive: true, force: true });
+    if (pathExists(item.source)) rmSync(item.source, { recursive: true, force: true });
     if (item.kind === "missing" || !item.backup) continue;
     mkdirSync(dirname(item.source), { recursive: true });
     cpSync(item.backup, item.source, { recursive: true, dereference: false });
   }
+}
+
+function withBackup(label: string, paths: string[], action: () => void): string {
+  const root = backup(paths);
+  try {
+    action();
+  } catch (error) {
+    const reason = (error as Error).message;
+    try {
+      restoreBackup(root);
+    } catch (restoreError) {
+      throw new Error(`${label} failed and rollback from ${root} also failed (${(restoreError as Error).message}): ${reason}`);
+    }
+    throw new Error(`${label} failed; rolled back from ${root}: ${reason}`);
+  }
+  cleanOldBackups();
+  return root;
 }
 
 function cleanOldBackups(): void {
@@ -912,19 +935,14 @@ function syncInstructions(args: string[]): void {
   console.log(`Plan: link ${changes.length} CLAUDE.md path(s) to AGENTS.md`);
   if (!apply) return;
   if (conflicts.length && !args.includes("--replace")) fail(`existing CLAUDE.md requires explicit --replace: ${conflicts.map((item) => item.claude).join(", ")}`);
-  const backupRoot = backup(changes.map((item) => item.claude));
-  try {
+  const backupRoot = withBackup("instruction sync", changes.map((item) => item.claude), () => {
     for (const item of changes) {
       if (pathExists(item.claude)) rmSync(item.claude, { recursive: true, force: true });
       mkdirSync(dirname(item.claude), { recursive: true });
       symlinkSync(relative(dirname(item.claude), item.agents), item.claude);
     }
-    cleanOldBackups();
-    console.log(`Applied ${changes.length} instruction link(s). Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`instruction sync failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Applied ${changes.length} instruction link(s). Backup: ${backupRoot}`);
 }
 
 function strictSkillIssueCode(issue: string, canonical: boolean): string | undefined {
@@ -1153,8 +1171,7 @@ function portableConfigRegister(args: string[]): void {
   if (existsSync(source) && sourceWillChange && !args.includes("--replace-source")) fail(`portable source exists with different content; review and pass --replace-source: ${source}`);
   const syncedRoot = findSyncthingRoot(target);
   const ignore = syncedRoot ? join(syncedRoot, ".stignore") : undefined;
-  const backupRoot = backup([portableConfigManifestPath, source, ...(ignore ? [ignore] : [])]);
-  try {
+  const backupRoot = withBackup("portable config registration", [portableConfigManifestPath, source, ...(ignore ? [ignore] : [])], () => {
     if (sourceWillChange) {
       mkdirSync(dirname(source), { recursive: true });
       cpSync(seed, source);
@@ -1163,12 +1180,8 @@ function portableConfigRegister(args: string[]): void {
     manifest.configs[id] = entry;
     writeJsonAtomic(portableConfigManifestPath, manifest);
     ensureTargetIgnored(target);
-    cleanOldBackups();
-    console.log(`Registered portable config ${id}. Manifest: ${portableConfigManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`portable config registration failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Registered portable config ${id}. Manifest: ${portableConfigManifestPath}. Backup: ${backupRoot}`);
 }
 
 function portableConfigRender(args: string[]): void {
@@ -1200,8 +1213,7 @@ function portableConfigRender(args: string[]): void {
     const root = findSyncthingRoot(item.target);
     return [item.target, ...(root ? [join(root, ".stignore")] : [])];
   });
-  const backupRoot = backup(affected);
-  try {
+  const backupRoot = withBackup("portable config render", affected, () => {
     for (const item of operations) {
       ensureTargetIgnored(item.target);
       if (item.changed) {
@@ -1212,12 +1224,8 @@ function portableConfigRender(args: string[]): void {
     }
     const remaining = inspectPortableConfigs(manifest);
     if (remaining.length) throw new Error(`render left ${remaining.length} portable config issue(s)`);
-    cleanOldBackups();
-    console.log(`Rendered ${operations.length} portable config(s). Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`portable config render failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Rendered ${operations.length} portable config(s). Backup: ${backupRoot}`);
 }
 
 function portableConfigCommand(args: string[]): void {
@@ -1260,8 +1268,7 @@ function addSkill(args: string[]): void {
   console.log(`Plan: ${command.join(" ")}`);
   if (!apply) return;
   const before = currentSkillManifest();
-  const backupRoot = backup([canonicalSkills, ...harnesses.map((item) => item.skillDir), skillManifestPath]);
-  try {
+  const backupRoot = withBackup("add", skillMutationPaths(), () => {
     run(command);
     const after = scanSkillManifest(canonicalSkills, globalSkillLocks(), before);
     const selectedIndex = sourceArgs.indexOf("--skill");
@@ -1279,12 +1286,12 @@ function addSkill(args: string[]): void {
       }
     }
     writeJsonAtomic(skillManifestPath, after);
-    cleanOldBackups();
-    console.log(`Applied. Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`add failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Applied. Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
+}
+
+function skillMutationPaths(): string[] {
+  return [...globalSkillLocks(), canonicalSkills, ...harnesses.map((item) => item.skillDir), skillManifestPath];
 }
 
 function npxLockOwns(name: string): boolean {
@@ -1313,19 +1320,14 @@ function removeSkill(name: string, args: string[]): void {
   if (!targets.length) fail(`skill not found: ${name}`);
   console.log(`Plan: remove ${name} from ${targets.length} path(s):\n${targets.join("\n")}`);
   if (!apply) return;
-  const backupRoot = backup([...targets, ...globalSkillLocks(), skillManifestPath]);
-  try {
+  const backupRoot = withBackup("remove", [...targets, ...globalSkillLocks(), skillManifestPath], () => {
     if (npxLockOwns(name)) run(["npx", "--yes", "skills", "remove", name, "-g", "-y"]);
     for (const target of targets) removeExistingPath(target);
     const manifest = readSkillManifest();
     delete manifest.skills[name];
     writeJsonAtomic(skillManifestPath, manifest);
-    cleanOldBackups();
-    console.log(`Removed ${name}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`remove failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Removed ${name}. Backup: ${backupRoot}`);
 }
 
 function updateSkills(names: string[], args: string[]): void {
@@ -1343,8 +1345,7 @@ function updateSkills(names: string[], args: string[]): void {
   if (cleanNames.length && unknown.length) fail(`cannot update skills with unknown source: ${unknown.join(", ")}`);
   if (!apply) return;
   const agents = detectedHarnesses().filter((item) => item.installed && item.npxAgent).map((item) => item.npxAgent!);
-  const backupRoot = backup([...globalSkillLocks(), canonicalSkills, skillManifestPath]);
-  try {
+  const backupRoot = withBackup("update", skillMutationPaths(), () => {
     for (const name of tracked) {
       const item = manifest.skills[name];
       run(["npx", "--yes", "skills", "add", skillInstallSource(item)!, "--skill", name, ...(item.fullDepth ? ["--full-depth"] : []), "-g", "-y", "--agent", ...agents]);
@@ -1353,10 +1354,8 @@ function updateSkills(names: string[], args: string[]): void {
     assertStandaloneSkills(tracked);
     for (const name of tracked) refreshed.skills[name].provenance = "install";
     writeJsonAtomic(skillManifestPath, refreshed);
-    cleanOldBackups();
-    console.log(`Applied ${tracked.length} update(s). Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
-  }
-  catch (error) { restoreBackup(backupRoot); throw new Error(`update failed; rolled back from ${backupRoot}: ${(error as Error).message}`); }
+  });
+  console.log(`Applied ${tracked.length} update(s). Provenance: ${skillManifestPath}. Backup: ${backupRoot}`);
 }
 
 function initState(args: string[]): void {
@@ -1370,16 +1369,11 @@ function initState(args: string[]): void {
   console.log(`Plan: inventory ${Object.keys(skillManifest.skills).length} canonical skill(s); known source=${knownSkills}; unknown source=${Object.keys(skillManifest.skills).length - knownSkills}`);
   console.log(`Plan: inventory ${Object.keys(mcpManifest.servers).length} MCP server(s); known upstream=${knownMcps}; unknown upstream=${Object.keys(mcpManifest.servers).length - knownMcps}; conflicts=${mcpConflicts}`);
   if (!apply) return;
-  const backupRoot = backup([skillManifestPath, mcpManifestPath]);
-  try {
+  const backupRoot = withBackup("init", [skillManifestPath, mcpManifestPath], () => {
     writeJsonAtomic(skillManifestPath, skillManifest);
     writeJsonAtomic(mcpManifestPath, mcpManifest);
-    cleanOldBackups();
-    console.log(`Initialized ${skillManifestPath} and ${mcpManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`init failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Initialized ${skillManifestPath} and ${mcpManifestPath}. Backup: ${backupRoot}`);
 }
 
 function hasSecretLiterals(servers: Record<string, McpServer>): boolean {
@@ -2035,8 +2029,7 @@ function mcpSync(args: string[]): void {
     const unsafe = targetPaths.filter((path) => !gitIgnored(path));
     if (unsafe.length) fail(`secret-bearing project configs must be gitignored: ${unsafe.join(", ")}`);
   }
-  const backupRoot = backup([...targetPaths, mcpManifestPath]);
-  try {
+  const backupRoot = withBackup("MCP sync", [...targetPaths, mcpManifestPath], () => {
     for (const harness of ["codex", "pi", "opencode", "hermes", "goose", "catalog"]) {
       const target = targets.find((item) => item.harness === harness);
       const selected = Object.fromEntries(built.plan.operations.filter((operation) => operation.targets.some((item) => item.binding === (target ? bindingId(target) : ""))).map((operation) => [operation.server, built.definitions[operation.server]]));
@@ -2053,12 +2046,8 @@ function mcpSync(args: string[]): void {
       }
     }
     writeJsonAtomic(mcpManifestPath, scanMcpManifest(mcpSources(), readMcpManifest()));
-    cleanOldBackups();
-    console.log(`Applied ${built.plan.operations.reduce((count, operation) => count + operation.targets.length, 0)} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`MCP sync failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Applied ${built.plan.operations.reduce((count, operation) => count + operation.targets.length, 0)} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
 }
 
 function mcpRemove(args: string[]): void {
@@ -2098,8 +2087,8 @@ function mcpRemove(args: string[]): void {
   if (!plan.operations.length) return;
 
   const targetPaths = [...new Set(plan.operations.flatMap((operation) => operation.targets.map((target) => target.path)))];
-  const backupRoot = backup([...targetPaths, mcpManifestPath]);
-  try {
+  const count = plan.operations.reduce((total, operation) => total + operation.targets.length, 0);
+  const backupRoot = withBackup("MCP removal", [...targetPaths, mcpManifestPath], () => {
     for (const target of targets) {
       const selected = plan.operations.filter((operation) => operation.targets.some((item) => item.binding === bindingId(target))).map((operation) => operation.server);
       if (!selected.length) continue;
@@ -2110,13 +2099,8 @@ function mcpRemove(args: string[]): void {
       }
     }
     writeJsonAtomic(mcpManifestPath, scanMcpManifest(mcpSources(), readMcpManifest()));
-    cleanOldBackups();
-    const count = plan.operations.reduce((total, operation) => total + operation.targets.length, 0);
-    console.log(`Removed ${count} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
-  } catch (error) {
-    restoreBackup(backupRoot);
-    throw new Error(`MCP removal failed; rolled back from ${backupRoot}: ${(error as Error).message}`);
-  }
+  });
+  console.log(`Removed ${count} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
 }
 
 function usage(): void {

@@ -202,6 +202,22 @@ esac
     expect(runCli(root, "doctor", "--strict", "--json").exitCode).toBe(0);
   });
 
+  test("rolls back and reports the backup when an apply step fails", () => {
+    const root = fixture();
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    const target = join(root, ".claude", "settings.json");
+    const source = join(root, ".agents", "harness-sync", "claude-settings.json");
+    writeFileSync(target, "{\"theme\":\"dark\"}\n");
+    expect(runCli(root, "portable-config", "register", "--id", "claude-settings", "--source", source, "--target", target, "--seed-from", target, "--apply", "--confirmed").exitCode).toBe(0);
+    writeFileSync(source, "{\"theme\":\"light\"}\n");
+    chmodSync(target, 0o400);
+    const result = runCli(root, "portable-config", "render", "--id", "claude-settings", "--apply", "--confirmed");
+    chmodSync(target, 0o600);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString() + result.stdout.toString()).toContain("portable config render failed; rolled back from");
+    expect(readFileSync(target, "utf8")).toBe("{\"theme\":\"dark\"}\n");
+  });
+
   test("keeps new timestamped backups next to manually named backup directories", () => {
     const root = fixture();
     mkdirSync(join(root, ".claude"), { recursive: true });

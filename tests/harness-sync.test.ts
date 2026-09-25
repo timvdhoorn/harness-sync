@@ -508,6 +508,27 @@ describe("MCP normalization", () => {
     }
   });
 
+  test("writes through a symlinked target config instead of replacing the link", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const real = join(root, "dotfiles", "mcp.json");
+    mkdirSync(dirname(real), { recursive: true });
+    writeFileSync(real, "{}\n");
+    const link = join(root, "mcp.json");
+    symlinkSync(real, link);
+    renderDirectTarget("pi", link, { demo: { command: "npx", args: ["demo"] } });
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(normalizeMcpFile(real).demo?.command).toBe("npx");
+  });
+
+  test("refuses to write through a dangling symlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const link = join(root, "mcp.json");
+    symlinkSync(join(root, "missing.json"), link);
+    expect(() => renderDirectTarget("pi", link, { demo: { command: "npx" } })).toThrow("dangling symlink");
+  });
+
   test("renders Pi without losing unknown fields or unrelated servers", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);
