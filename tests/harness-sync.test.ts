@@ -557,6 +557,33 @@ describe("MCP normalization", () => {
     expect(normalizeMcpFile(real).demo?.command).toBe("npx");
   });
 
+  test("restores the real file behind a symlinked config when a later step fails", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    mkdirSync(join(root, "dotfiles"), { recursive: true });
+    mkdirSync(join(root, ".codex"), { recursive: true });
+    writeFileSync(join(root, "dotfiles", "config.toml"), 'model = "o3"\n');
+    symlinkSync(join(root, "dotfiles", "config.toml"), join(root, ".codex", "config.toml"));
+    mkdirSync(join(root, ".config", "opencode"), { recursive: true });
+    writeFileSync(join(root, ".config", "opencode", "opencode.json"), "{}\n");
+    chmodSync(join(root, ".config", "opencode"), 0o555);
+    writeFileSync(join(root, "source.json"), JSON.stringify({ mcpServers: { fs: { command: "npx", args: ["fs"] } } }));
+    mkdirSync(join(root, "bin"));
+    for (const name of ["codex", "opencode"]) {
+      writeFileSync(join(root, "bin", name), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(root, "bin", name), 0o755);
+    }
+    const result = Bun.spawnSync([process.execPath, "run", join(import.meta.dir, "..", "scripts", "harness-sync.ts"), "mcp", "--from", join(root, "source.json"), "--target", "codex", "--target", "opencode", "--scope", "global", "--non-interactive", "--apply", "--confirmed"], {
+      cwd: root,
+      env: { ...process.env, HOME: root, XDG_STATE_HOME: join(root, "state"), PATH: `${join(root, "bin")}:/usr/bin:/bin` },
+    });
+    chmodSync(join(root, ".config", "opencode"), 0o755);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain("rolled back from");
+    expect(readFileSync(join(root, "dotfiles", "config.toml"), "utf8")).toBe('model = "o3"\n');
+    expect(lstatSync(join(root, ".codex", "config.toml")).isSymbolicLink()).toBe(true);
+  });
+
   test("refuses to write through a dangling symlink", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);

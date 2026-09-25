@@ -242,12 +242,24 @@ function timestamp(): string {
   return new Date().toISOString().replaceAll(":", "-");
 }
 
+function backupSources(paths: string[]): string[] {
+  const sources: string[] = [];
+  for (const path of new Set(paths)) {
+    sources.push(path);
+    if (!pathExists(path) || !lstatSync(path).isSymbolicLink()) continue;
+    try {
+      sources.push(realpathSync(path));
+    } catch { /* a dangling link has no target to preserve */ }
+  }
+  return [...new Set(sources)];
+}
+
 function backup(paths: string[]): string {
   const root = join(stateRoot, "backups", timestamp());
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
   const manifest: Array<{ source: string; backup?: string; kind: "file" | "directory" | "symlink" | "missing" }> = [];
-  for (const source of [...new Set(paths)]) {
+  for (const source of backupSources(paths)) {
     if (!pathExists(source)) {
       manifest.push({ source, kind: "missing" });
       continue;
@@ -266,12 +278,19 @@ function restoreBackup(root: string): void {
   const manifestPath = join(root, "manifest.json");
   if (!existsSync(manifestPath)) return;
   const manifest = readJson(manifestPath) as Array<{ source: string; backup?: string; kind: string }>;
+  const failed: string[] = [];
   for (const item of manifest.reverse()) {
-    if (pathExists(item.source)) rmSync(item.source, { recursive: true, force: true });
-    if (item.kind === "missing" || !item.backup) continue;
-    mkdirSync(dirname(item.source), { recursive: true });
-    cpSync(item.backup, item.source, { recursive: true, dereference: false });
+    try {
+      if (item.kind === "file" && item.backup && pathExists(item.source) && lstatSync(item.source).isFile() && hashFile(item.source) === hashFile(item.backup)) continue;
+      if (pathExists(item.source)) rmSync(item.source, { recursive: true, force: true });
+      if (item.kind === "missing" || !item.backup) continue;
+      mkdirSync(dirname(item.source), { recursive: true });
+      cpSync(item.backup, item.source, { recursive: true, dereference: false });
+    } catch (error) {
+      failed.push(`${item.source} (${(error as Error).message})`);
+    }
   }
+  if (failed.length) throw new Error(`could not restore ${failed.join("; ")}`);
 }
 
 function withBackup(label: string, paths: string[], action: () => void): string {
