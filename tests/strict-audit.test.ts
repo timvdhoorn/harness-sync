@@ -202,6 +202,26 @@ esac
     expect(runCli(root, "doctor", "--strict", "--json").exitCode).toBe(0);
   });
 
+  test("keeps new timestamped backups next to manually named backup directories", () => {
+    const root = fixture();
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    const backups = join(root, "state", "harness-sync", "backups");
+    const manual = Array.from({ length: 10 }, (_, index) => `manual-${index}`);
+    for (const name of manual) mkdirSync(join(backups, name), { recursive: true });
+    const stale = Array.from({ length: 12 }, (_, index) => `2020-01-${String(index + 1).padStart(2, "0")}T00-00-00.000Z`);
+    for (const name of stale) mkdirSync(join(backups, name), { recursive: true });
+    const target = join(root, ".claude", "settings.json");
+    const source = join(root, ".agents", "harness-sync", "claude-settings.json");
+    writeFileSync(target, "{}\n");
+    expect(runCli(root, "portable-config", "register", "--id", "claude-settings", "--source", source, "--target", target, "--seed-from", target, "--apply", "--confirmed").exitCode).toBe(0);
+    const entries = readdirSync(backups);
+    const timestamped = entries.filter((name) => /^\d{4}-\d{2}-\d{2}T/.test(name)).sort();
+    expect(entries).toEqual(expect.arrayContaining(manual));
+    expect(timestamped).toHaveLength(10);
+    expect(timestamped.at(-1)!.startsWith("2020-")).toBe(false);
+    expect(timestamped).not.toContain(stale[0]);
+  });
+
   test.each(["missing", "conflict", "wrong-link"])("fails on a %s Claude entrypoint when canonical instructions exist", (state) => {
     const root = fixture();
     write(root, "project/AGENTS.md", "Project instructions\n");

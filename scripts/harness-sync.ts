@@ -271,7 +271,7 @@ function restoreBackup(root: string): void {
 function cleanOldBackups(): void {
   const root = join(stateRoot, "backups");
   if (!existsSync(root)) return;
-  const entries = readdirSync(root).sort().reverse();
+  const entries = readdirSync(root).filter((name) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z$/.test(name)).sort().reverse();
   for (const stale of entries.slice(10)) rmSync(join(root, stale), { recursive: true, force: true });
 }
 
