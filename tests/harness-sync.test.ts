@@ -992,6 +992,24 @@ describe("MCP provenance", () => {
     expect(JSON.stringify(manifest)).not.toContain("secret");
   });
 
+  test("resolves Grok agent-mcp-from-pi wrappers like Codex and reports missing references", () => {
+    const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
+    temporary.push(root);
+    const pi = join(root, "mcp.json");
+    const grok = join(root, "grok.toml");
+    const claude = join(root, "claude.json");
+    writeFileSync(pi, JSON.stringify({ mcpServers: { shadcn: { command: "npx", args: ["shadcn@latest", "mcp"] } } }));
+    writeFileSync(claude, JSON.stringify({ mcpServers: { shadcn: { command: "npx", args: ["shadcn@latest", "mcp"] } } }));
+    writeFileSync(grok, '[mcp_servers.shadcn]\ncommand = "/home/test/.codex/bin/agent-mcp-from-pi"\nargs = ["shadcn"]\n\n[mcp_servers.typo]\ncommand = "/home/test/.codex/bin/agent-mcp-from-pi"\nargs = ["typo"]\n');
+    const sources = [
+      { harness: "grok", path: grok, scope: "global" as const },
+      { harness: "pi", path: pi, scope: "global" as const },
+      { harness: "claude", path: claude, scope: "global" as const },
+    ];
+    expect(scanMcpManifest(sources, { version: 1, servers: {} }, "now").servers.shadcn.conflict).toBeFalse();
+    expect(inspectMcpConfigurations(sources, "linux")).toContainEqual(expect.objectContaining({ issue: "missing-pi-server", harness: "grok", server: "typo" }));
+  });
+
   test("reports non-portable Pi env paths and their indirect Codex dependency", () => {
     const root = mkdtempSync(join(tmpdir(), "harness-sync-test-"));
     temporary.push(root);

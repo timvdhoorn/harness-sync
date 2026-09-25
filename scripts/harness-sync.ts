@@ -584,6 +584,8 @@ function mcpInventory(path: string): string[] {
   try { return Object.keys(normalizeMcpFile(path)); } catch { return []; }
 }
 
+const piWrapperHarnesses = new Set(["codex", "grok"]);
+
 export function piServerReference(server: McpServer): string | undefined {
   if (!server.command || basename(server.command) !== "agent-mcp-from-pi") return undefined;
   if (server.url || server.args?.length !== 1 || !server.args[0]) return undefined;
@@ -645,7 +647,7 @@ export function inspectMcpConfigurations(
   const dependents = new Map<string, string[]>();
   const issues: McpAuditIssue[] = [];
 
-  for (const item of loaded.filter((entry) => entry.source.harness === "codex")) {
+  for (const item of loaded.filter((entry) => piWrapperHarnesses.has(entry.source.harness))) {
     for (const [name, server] of Object.entries(item.servers)) {
       const reference = piServerReference(server);
       if (!reference) continue;
@@ -1830,7 +1832,7 @@ export function scanMcpManifest(
   const found = new Map<string, Array<{ server: McpServer; installation: McpInstallation }>>();
   for (const { source, servers } of loaded) {
     for (const [name, rawServer] of Object.entries(servers)) {
-      const reference = source.harness === "codex" ? piServerReference(rawServer) : undefined;
+      const reference = piWrapperHarnesses.has(source.harness) ? piServerReference(rawServer) : undefined;
       const effectiveServer = reference && pi?.servers[reference] ? pi.servers[reference] : rawServer;
       const entries = found.get(name) ?? [];
       entries.push({
@@ -1882,7 +1884,7 @@ export function sameMcpServer(left: McpServer, right: McpServer): boolean {
 }
 
 function effectiveMcpServers(harness: string, servers: Record<string, McpServer>): Record<string, McpServer> {
-  if (harness !== "codex") return servers;
+  if (!piWrapperHarnesses.has(harness)) return servers;
   const piPath = mcpTargetPath("pi", "global");
   if (!piPath || !existsSync(piPath)) return servers;
   let piServers: Record<string, McpServer>;
@@ -2154,7 +2156,7 @@ function mcpSync(args: string[]): void {
     const path = mcpTargetPath(harness, effectiveScope as "project" | "global");
     if (!path) return [];
     const raw = existsSync(path) ? normalizeMcpFile(path) : {};
-    const effective = harness === "codex" ? effectiveMcpServers(harness, raw) : raw;
+    const effective = effectiveMcpServers(harness, raw);
     const managedWrappers = replaceWrappers && harness === "codex"
       ? Object.entries(raw).filter(([, server]) => piServerReference(server)).map(([name]) => name)
       : [];
