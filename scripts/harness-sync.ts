@@ -60,7 +60,7 @@ export type PortableConfigIssue = {
   path: string;
 };
 type MarketplaceSkill = { name: string; hash: string; status: "available" | "canonical" | "conflict"; sources: Array<{ harness: string; marketplace: string; plugin: string; path: string }> };
-type StrictAuditFinding = { code: string; path: string; server?: string; field?: string; scope?: McpSource["scope"]; event?: string; hook?: number; id?: string };
+type StrictAuditFinding = { code: string; path: string; server?: string; field?: string; scope?: McpSource["scope"]; event?: string; hook?: number; id?: string; harness?: string; project?: string; skill?: string; key?: string };
 type StrictAuditSummary = { actionable: boolean; findings: StrictAuditFinding[] };
 export type TrackedSkill = {
   source: string | null;
@@ -104,6 +104,18 @@ export type TrackedMcp = {
   provenance: "inferred" | "scan";
 };
 export type McpManifest = { version: 1; servers: Record<string, TrackedMcp> };
+export type McpBindingState = { global?: boolean; projects?: Record<string, boolean> };
+export type McpBindings = { version: 1; servers: Record<string, Record<string, McpBindingState>> };
+export type McpBindingIssue = {
+  issue: "disabled-present" | "enabled-missing" | "unknown-server";
+  server: string;
+  harness: string;
+  scope: "project" | "global";
+  project?: string;
+};
+export type SkillOverrideValue = string | number | boolean;
+export type SkillOverrides = { version: 1; skills: Record<string, { frontmatter: Record<string, SkillOverrideValue> }> };
+export type SkillOverrideIssue = { issue: "override-missing" | "skill-missing" | "invalid-frontmatter"; skill: string; key?: string; path: string };
 export type McpTargetBinding = McpSource & { servers: Record<string, McpServer>; managedWrappers?: string[] };
 export type McpResolution = { action: "variant" | "merge" | "skip"; variant?: string };
 type AppOwnedMcp = { owner: "codex" | "claude"; platform: "darwin"; field: "command"; value: string };
@@ -138,6 +150,7 @@ export type McpSyncPlan = {
     binding: string;
     reasons: McpCompatibilityReason[];
   }>;
+  skippedDisabled: Array<{ server: string; binding: string; reason: "disabled-by-binding" }>;
   writes: [];
   requiresSeparateApplyConsent: boolean;
   exitCode: number;
@@ -168,6 +181,24 @@ const canonicalSkills = join(home, ".agents", "skills");
 const skillManifestPath = join(stateRoot, "skills.json");
 const mcpManifestPath = join(stateRoot, "mcps.json");
 const portableConfigManifestPath = join(home, ".agents", "harness-sync", "portable-configs.json");
+const pathConfigFile = join(home, ".agents", "harness-sync", "config.json");
+
+/** Optional path overrides: env first, then `~/.agents/harness-sync/config.json` `paths`, then the default. */
+function configuredPath(envName: string, key: string, fallback: string): string {
+  let configured: unknown = process.env[envName];
+  if (!configured && existsSync(pathConfigFile)) {
+    try {
+      configured = (JSON.parse(readFileSync(pathConfigFile, "utf8")) as { paths?: Record<string, unknown> }).paths?.[key];
+    } catch {
+      throw new Error(`invalid JSON in ${pathConfigFile}`);
+    }
+  }
+  if (typeof configured !== "string" || !configured) return fallback;
+  return configured === "~" || configured.startsWith("~/") ? join(home, configured.slice(1)) : configured;
+}
+
+const mcpBindingsPath = configuredPath("HARNESS_SYNC_MCP_BINDINGS", "mcpBindings", join(home, ".agents", "mcp", "bindings.json"));
+const skillOverridesPath = configuredPath("HARNESS_SYNC_SKILL_OVERRIDES", "skillOverrides", join(home, ".agents", "skills-overrides.json"));
 const cwd = process.cwd();
 
 export const harnesses: Harness[] = [
@@ -457,6 +488,16 @@ export function skillInstallSource(item: TrackedSkill): string | null {
   return item.installSource ?? item.source;
 }
 
+// A local install source that no longer exists cannot be reinstalled; the caller keeps the canonical copy.
+export function missingLocalSkillSource(item: TrackedSkill, base = cwd): string | undefined {
+  const source = skillInstallSource(item);
+  if (!source) return undefined;
+  const local = item.sourceType === "local" || isAbsolute(source) || source === "~" || source.startsWith("~/") || source.startsWith("./") || source.startsWith("../");
+  if (!local) return undefined;
+  const path = source === "~" || source.startsWith("~/") ? resolvePortablePath(source) : resolve(base, source);
+  return existsSync(path) ? undefined : path;
+}
+
 function detectedHarnesses(): Array<Harness & { installed: boolean }> {
   return harnesses.map((harness) => ({ ...harness, installed: commandExists(harness.executable) }));
 }
@@ -584,7 +625,7 @@ function mcpInventory(path: string): string[] {
   try { return Object.keys(normalizeMcpFile(path)); } catch { return []; }
 }
 
-const sharedCatalogPath = join(home, ".agents", "mcp", "mcp.json");
+const sharedCatalogPath = configuredPath("HARNESS_SYNC_MCP_CATALOG", "mcpCatalog", join(home, ".agents", "mcp", "mcp.json"));
 
 // Launcher bindings resolve to the shared catalog when present, otherwise to the global Pi config.
 function launcherSource<T extends { source: McpSource }>(loaded: T[]): T | undefined {
@@ -1025,6 +1066,8 @@ function classifyStrictAudit(
   instructions: InstructionsStatus[],
   hookIssues: HookAuditIssue[],
   portableConfigIssues: PortableConfigIssue[],
+  bindingAudit: { path: string; error?: string; issues: McpBindingIssue[] } = { path: mcpBindingsPath, issues: [] },
+  overrideAudit: { path: string; error?: string; issues: SkillOverrideIssue[] } = { path: skillOverridesPath, issues: [] },
 ): StrictAuditSummary {
   const findings: StrictAuditFinding[] = [];
   if (!canonicalExists && !canonicalIssues.some((item) => item.issue === "missing-directory")) {
@@ -1055,6 +1098,23 @@ function classifyStrictAudit(
   for (const item of portableConfigIssues) {
     findings.push({ code: `portable-config-${item.issue}`, path: item.path, id: item.id });
   }
+  if (bindingAudit.error) findings.push({ code: "mcp-bindings-invalid", path: bindingAudit.path });
+  for (const item of bindingAudit.issues) {
+    findings.push({
+      code: `mcp-binding-${item.issue}`,
+      path: item.issue === "unknown-server" ? bindingAudit.path : bindingTargetPath(item.harness, item.scope),
+      server: item.server,
+      harness: item.harness,
+      scope: item.scope,
+      ...(item.project ? { project: item.project } : {}),
+    });
+  }
+  if (overrideAudit.error) findings.push({ code: "skill-overrides-invalid", path: overrideAudit.path });
+  for (const item of overrideAudit.issues) {
+    // A skill may be intentionally absent on this machine; only drift in an installed skill is actionable.
+    if (item.issue === "skill-missing") continue;
+    findings.push({ code: `skill-override-${item.issue}`, path: item.path, skill: item.skill, ...(item.key ? { key: item.key } : {}) });
+  }
   return { actionable: findings.length > 0, findings };
 }
 
@@ -1062,7 +1122,29 @@ function redactMcpAuditIssues(issues: McpAuditIssue[]): McpAuditIssue[] {
   return issues.map((item) => ({ ...item, value: "[redacted]" }));
 }
 
-function audit(asJson: boolean, strict = false): void {
+export function auditMcpBindings(): { path: string; exists: boolean; servers: number; error?: string; issues: McpBindingIssue[] } {
+  const exists = existsSync(mcpBindingsPath);
+  try {
+    const bindings = readMcpBindings();
+    let catalog: string[] = [];
+    try { catalog = Object.keys(mcpDefinitionStore()); } catch { /* audit reports catalog parse errors elsewhere */ }
+    return { path: mcpBindingsPath, exists, servers: Object.keys(bindings.servers).length, issues: inspectMcpBindings(bindings, catalog, actualMcpNames) };
+  } catch (error) {
+    return { path: mcpBindingsPath, exists, servers: 0, error: (error as Error).message, issues: [] };
+  }
+}
+
+function auditSkillOverrides(): { path: string; exists: boolean; skills: number; error?: string; issues: SkillOverrideIssue[] } {
+  const exists = existsSync(skillOverridesPath);
+  try {
+    const overrides = readSkillOverrides();
+    return { path: skillOverridesPath, exists, skills: Object.keys(overrides.skills).length, issues: inspectSkillOverrides(overrides) };
+  } catch (error) {
+    return { path: skillOverridesPath, exists, skills: 0, error: (error as Error).message, issues: [] };
+  }
+}
+
+function collectAudit(strict: boolean) {
   const canonicalIssues = inspectCanonicalSkillDirectory(canonicalSkills);
   const skills = detectedHarnesses().map((harness) => ({
     id: harness.id,
@@ -1088,14 +1170,23 @@ function audit(asJson: boolean, strict = false): void {
   const portableConfigManifest = readPortableConfigManifest();
   const portableConfigIssues = inspectPortableConfigs(portableConfigManifest);
   const portableConfigs = { path: portableConfigManifestPath, exists: existsSync(portableConfigManifestPath), configs: Object.keys(portableConfigManifest.configs).sort(), issues: portableConfigIssues };
-  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, mcpIssues, instructions, hookIssues, portableConfigs };
+  const mcpBindings = auditMcpBindings();
+  const skillOverrides = auditSkillOverrides();
+  const result = { canonicalSkills, canonicalExists: existsSync(canonicalSkills), canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, mcpIssues, mcpBindings, instructions, hookIssues, portableConfigs, skillOverrides };
   const strictSummary = strict
-    ? classifyStrictAudit(result.canonicalExists, canonicalIssues, skills, mcpIssues, mcpManifest, instructions, hookIssues, portableConfigIssues)
+    ? classifyStrictAudit(result.canonicalExists, canonicalIssues, skills, mcpIssues, mcpManifest, instructions, hookIssues, portableConfigIssues, mcpBindings, skillOverrides)
     : undefined;
+  return { result, strictSummary };
+}
+
+function audit(asJson: boolean, strict = false): void {
+  const { result, strictSummary } = collectAudit(strict);
+  const { canonicalSkills: canonical, canonicalIssues, skills, marketplaceSkills, mcp, mcpProvenance, mcpIssues, mcpBindings, instructions, hookIssues, portableConfigs, skillOverrides } = result;
+  const portableConfigIssues = portableConfigs.issues;
   const output = strict ? { ...result, strict: strictSummary } : result;
   if (asJson) console.log(JSON.stringify(output, null, 2));
   else {
-    console.log(`Canonical skills: ${canonicalSkills} (${result.canonicalExists ? "ok" : "missing"})`);
+    console.log(`Canonical skills: ${canonical} (${result.canonicalExists ? "ok" : "missing"})`);
     if (canonicalIssues.length) console.log(`canonical issues: ${canonicalIssues.length}`);
     for (const item of skills) console.log(`${item.id}: ${item.installed ? "installed" : "config-only"}; skill-issues=${item.issues.length}`);
     const candidates = marketplaceSkills.filter((item) => item.status !== "canonical");
@@ -1115,6 +1206,10 @@ function audit(asJson: boolean, strict = false): void {
         console.log(`MCP portability: ${item.path}: ${item.server} ${item.field}=${item.value} is not portable on ${platform()}; indirect harnesses=${item.indirectHarnesses.join(", ") || "none"}`);
       }
     }
+    console.log(`MCP bindings: ${mcpBindings.error ?? (mcpBindings.exists ? `${mcpBindings.servers} server(s); drift=${mcpBindings.issues.length}` : "not initialized")}`);
+    for (const item of mcpBindings.issues) console.log(`MCP binding: ${item.server} ${item.harness} ${item.scope}${item.project ? ` ${item.project}` : ""}: ${item.issue}`);
+    console.log(`skill overrides: ${skillOverrides.error ?? (skillOverrides.exists ? `${skillOverrides.skills} skill(s); issues=${skillOverrides.issues.length}` : "not initialized")}`);
+    for (const item of skillOverrides.issues) console.log(`skill override: ${item.skill}${item.key ? ` ${item.key}` : ""}: ${item.issue}`);
     for (const item of instructions) console.log(`instructions ${item.root}: ${item.status}`);
     for (const item of hookIssues) console.log(`hook portability: ${item.path}: ${item.event}[${item.hook}] ${item.issue}`);
     console.log(`portable configs: ${portableConfigs.exists ? portableConfigs.configs.length : "not initialized"}; issues=${portableConfigIssues.length}`);
@@ -1175,6 +1270,10 @@ const commandFlags: Record<string, { switches: string[]; values: string[] }> = {
   update: { switches: ["--apply", "--confirmed"], values: [] },
   mcp: { switches: ["--apply", "--confirmed", "--direct", "--non-interactive"], values: ["--from", "--target", "--scope", "--server", "--resolve"] },
   "mcp-remove": { switches: ["--apply", "--confirmed"], values: ["--server", "--target", "--scope"] },
+  "mcp-enable": { switches: ["--apply", "--confirmed"], values: ["--server", "--target", "--project"] },
+  "mcp-disable": { switches: ["--apply", "--confirmed"], values: ["--server", "--target", "--project"] },
+  "skill-override": { switches: ["--apply", "--confirmed"], values: ["--skill", "--set"] },
+  serve: { switches: ["--tailscale"], values: ["--port"] },
 };
 
 export function assertKnownFlags(command: string, args: string[]): void {
@@ -1348,6 +1447,8 @@ function addSkill(args: string[]): void {
       .filter(([name, item]) => selected?.has(name) || before.skills[name]?.contentHash !== item.contentHash || !before.skills[name])
       .map(([name]) => name);
     assertStandaloneSkills(affected);
+    const overridden = applySkillOverrides(readSkillOverrides(), canonicalSkills, affected).changed;
+    if (overridden.length) Object.assign(after.skills, scanSkillManifest(canonicalSkills, globalSkillLocks(), after).skills);
     for (const name of affected) {
       const item = after.skills[name];
       if (item.source) {
@@ -1411,18 +1512,22 @@ function updateSkills(names: string[], args: string[]): void {
   const missing = requested.filter((name) => !manifest.skills[name]);
   if (missing.length) fail(`skills not found in manifest; run init first: ${missing.join(", ")}`);
   const unknown = requested.filter((name) => !manifest.skills[name].source);
-  const tracked = requested.filter((name) => manifest.skills[name].source);
+  const sourceMissing = requested.filter((name) => manifest.skills[name].source && missingLocalSkillSource(manifest.skills[name]));
+  const tracked = requested.filter((name) => manifest.skills[name].source && !sourceMissing.includes(name));
+  const overrides = readSkillOverrides();
   console.log(`Plan: reinstall ${tracked.length} tracked skill(s) from recorded sources; upstream changes are not compared before apply`);
-  for (const name of tracked) console.log(`  ${name} from ${skillInstallSource(manifest.skills[name])} (current ${manifest.skills[name].version})`);
+  for (const name of tracked) console.log(`  ${name} from ${skillInstallSource(manifest.skills[name])} (current ${manifest.skills[name].version})${overrides.skills[name] ? `; reapply overrides: ${Object.keys(overrides.skills[name].frontmatter).join(", ")}` : ""}`);
+  for (const name of sourceMissing) console.log(`Skip (source no longer exists; canonical copy kept): ${name} from ${missingLocalSkillSource(manifest.skills[name])}`);
   if (unknown.length) console.log(`Skip (unknown source): ${unknown.join(", ")}`);
   if (cleanNames.length && unknown.length) fail(`cannot update skills with unknown source: ${unknown.join(", ")}`);
-  if (!apply) return;
+  if (!apply || !tracked.length) return;
   const agents = detectedHarnesses().filter((item) => item.installed && item.npxAgent).map((item) => item.npxAgent!);
   const backupRoot = withBackup("update", skillMutationPaths(), () => {
     for (const name of tracked) {
       const item = manifest.skills[name];
       run(["npx", "--yes", "skills", "add", skillInstallSource(item)!, "--skill", name, ...(item.fullDepth ? ["--full-depth"] : []), "-g", "-y", "--agent", ...agents]);
     }
+    applySkillOverrides(overrides, canonicalSkills, tracked);
     const refreshed = scanSkillManifest(canonicalSkills, globalSkillLocks(), manifest);
     assertStandaloneSkills(tracked);
     for (const name of tracked) refreshed.skills[name].provenance = "install";
@@ -2027,21 +2132,29 @@ export function buildMcpRemovalPlan(
 
 export function buildMcpSyncPlan(
   source: McpTargetBinding,
-  targets: McpTargetBinding[],
+  allTargets: McpTargetBinding[],
   resolutions: Record<string, McpResolution> = {},
   mode: "interactive" | "non-interactive" = "non-interactive",
   currentPlatform: NodeJS.Platform = platform(),
+  desired: (server: string, harness: string) => boolean | undefined = () => undefined,
 ): { plan: McpSyncPlan; definitions: Record<string, McpServer> } {
   const identical: string[] = [], missing: string[] = [], conflicts: string[] = [], unrelated: string[] = [];
   const operations: McpSyncPlan["operations"] = [], unresolvedConflicts: McpSyncPlan["unresolvedConflicts"] = [];
   const skippedConflicts: string[] = [], skippedIncompatible: McpSyncPlan["skippedIncompatible"] = [], definitions: Record<string, McpServer> = {};
+  const skippedDisabled: McpSyncPlan["skippedDisabled"] = [];
   const sourceId = bindingId(source);
   const sourceNames = new Set(Object.keys(source.servers));
-  for (const target of targets) {
+  for (const target of allTargets) {
     for (const name of Object.keys(target.servers)) if (!sourceNames.has(name)) unrelated.push(`${target.harness}:${name}`);
   }
 
   for (const [name, sourceServer] of Object.entries(source.servers)) {
+    // A recorded disabled binding is never (re)added, compared, or overwritten by sync.
+    const targets = allTargets.filter((target) => {
+      if (desired(name, target.harness) !== false) return true;
+      skippedDisabled.push({ server: name, binding: bindingId(target), reason: "disabled-by-binding" });
+      return false;
+    });
     for (const target of targets) {
       if (!target.servers[name]) missing.push(`${target.harness}:${name}`);
       else if (sameMcpServer(sourceServer, target.servers[name])) identical.push(`${target.harness}:${name}`);
@@ -2137,11 +2250,398 @@ export function buildMcpSyncPlan(
     unresolvedConflicts,
     skippedConflicts,
     skippedIncompatible,
+    skippedDisabled,
     writes: [],
     requiresSeparateApplyConsent: operations.length > 0,
     exitCode: blocked ? 2 : 0,
   };
   return { plan, definitions };
+}
+
+const bindingHarnesses = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose"];
+
+export function readMcpBindings(path = mcpBindingsPath): McpBindings {
+  if (!existsSync(path)) return { version: 1, servers: {} };
+  const value = readJson(path);
+  const invalid = () => new Error(`invalid MCP bindings: ${path}`);
+  if (value?.version !== 1 || !value.servers || typeof value.servers !== "object" || Array.isArray(value.servers)) throw invalid();
+  for (const [server, harnessStates] of Object.entries(value.servers as Record<string, unknown>)) {
+    if (!harnessStates || typeof harnessStates !== "object" || Array.isArray(harnessStates)) throw invalid();
+    for (const [harness, state] of Object.entries(harnessStates as Record<string, any>)) {
+      if (!bindingHarnesses.includes(harness)) throw new Error(`invalid MCP bindings: ${path}: unsupported harness ${harness} for ${server}`);
+      if (!state || typeof state !== "object" || state.global !== undefined && typeof state.global !== "boolean") throw invalid();
+      if (state.projects !== undefined) {
+        if (harness !== "claude") throw new Error(`invalid MCP bindings: ${path}: project bindings are supported for claude only (${server})`);
+        if (typeof state.projects !== "object" || Object.values(state.projects).some((item) => typeof item !== "boolean")) throw invalid();
+      }
+    }
+  }
+  return value as McpBindings;
+}
+
+export function desiredMcpBinding(
+  bindings: McpBindings,
+  server: string,
+  harness: string,
+  scope: "project" | "global",
+  project?: string,
+): boolean | undefined {
+  const state = bindings.servers[server]?.[harness];
+  if (!state) return undefined;
+  if (scope === "global") return state.global;
+  return project ? state.projects?.[project] : undefined;
+}
+
+function sortedObject<T>(value: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+export function setMcpBinding(
+  bindings: McpBindings,
+  server: string,
+  harness: string,
+  enabled: boolean,
+  project?: string,
+): McpBindings {
+  const next = structuredClone(bindings);
+  const harnessStates = next.servers[server] ?? {};
+  const state = harnessStates[harness] ?? {};
+  if (project) state.projects = sortedObject({ ...(state.projects ?? {}), [project]: enabled });
+  else state.global = enabled;
+  harnessStates[harness] = state;
+  next.servers[server] = sortedObject(harnessStates);
+  next.servers = sortedObject(next.servers);
+  return next;
+}
+
+// Claude local scope: ~/.claude.json projects[<absolute project path>].mcpServers, kept outside the repository.
+export function claudeLocalServers(path: string, project: string): Record<string, McpServer> {
+  if (!existsSync(path)) return {};
+  const raw = readJson(path)?.projects?.[project]?.mcpServers;
+  return raw && typeof raw === "object" ? normalizeMcpMap(raw) : {};
+}
+
+export function claudeLocalProjects(path: string): string[] {
+  if (!existsSync(path)) return [];
+  const projects = readJson(path)?.projects;
+  if (!projects || typeof projects !== "object") return [];
+  return Object.entries(projects as Record<string, any>)
+    .filter(([, value]) => value?.mcpServers && typeof value.mcpServers === "object" && Object.keys(value.mcpServers).length)
+    .map(([project]) => project)
+    .sort();
+}
+
+function claudeServerShape(server: McpServer): Record<string, unknown> {
+  return server.url
+    ? { type: server.type === "sse" ? "sse" : "http", url: server.url, ...(server.headers ? { headers: server.headers } : {}) }
+    : { type: "stdio", command: server.command, args: server.args ?? [], ...(server.cwd ? { cwd: server.cwd } : {}), env: server.env ?? {} };
+}
+
+function writeClaudeLocal(path: string, project: string, servers: Record<string, McpServer>, remove: string[]): void {
+  const original = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+  const json: any = original === undefined ? {} : JSON.parse(original);
+  const projects = json.projects && typeof json.projects === "object" ? json.projects : (json.projects = {});
+  const entry = projects[project] && typeof projects[project] === "object" ? projects[project] : (projects[project] = {});
+  const target = entry.mcpServers && typeof entry.mcpServers === "object" ? entry.mcpServers : (entry.mcpServers = {});
+  for (const [name, server] of Object.entries(servers)) target[name] = claudeServerShape(server);
+  for (const name of remove) delete target[name];
+  writeJsonAtomic(path, json);
+  const outside = (document: any) => {
+    const copy = structuredClone(document ?? {});
+    const scoped = copy.projects?.[project]?.mcpServers;
+    if (scoped) for (const name of [...Object.keys(servers), ...remove]) delete scoped[name];
+    if (copy.projects?.[project] && scoped && !Object.keys(scoped).length) delete copy.projects[project].mcpServers;
+    if (copy.projects?.[project] && !Object.keys(copy.projects[project]).length) delete copy.projects[project];
+    if (copy.projects && !Object.keys(copy.projects).length) delete copy.projects;
+    return JSON.stringify(copy);
+  };
+  try {
+    const after = readJson(path);
+    const present = after.projects?.[project]?.mcpServers ?? {};
+    const wrong = [...Object.keys(servers).filter((name) => !(name in present)), ...remove.filter((name) => name in present)];
+    if (wrong.length) throw new Error(`rendered Claude local scope has unexpected server state: ${wrong.join(", ")}`);
+    if (original !== undefined && outside(JSON.parse(original)) !== outside(after)) throw new Error("rendered Claude local scope changed settings outside the selected servers");
+  } catch (error) {
+    if (original === undefined) rmSync(writeDestination(path), { force: true });
+    else writeTextAtomic(path, original);
+    throw new Error(`${(error as Error).message}; ${path} left unchanged`);
+  }
+}
+
+export function renderClaudeLocal(path: string, project: string, servers: Record<string, McpServer>): void {
+  writeClaudeLocal(path, project, servers, []);
+}
+
+export function removeClaudeLocal(path: string, project: string, names: string[]): void {
+  if (!existsSync(path)) return;
+  writeClaudeLocal(path, project, {}, names);
+}
+
+export function inspectMcpBindings(
+  bindings: McpBindings,
+  catalog: string[],
+  actual: (harness: string, scope: "project" | "global", project?: string) => Set<string>,
+): McpBindingIssue[] {
+  const known = new Set(catalog);
+  const issues: McpBindingIssue[] = [];
+  for (const [server, harnessStates] of Object.entries(bindings.servers)) {
+    for (const [harness, state] of Object.entries(harnessStates)) {
+      const check = (scope: "project" | "global", enabled: boolean, project?: string) => {
+        if (enabled && !known.has(server)) issues.push({ issue: "unknown-server", server, harness, scope, ...(project ? { project } : {}) });
+        const present = actual(harness, scope, project).has(server);
+        if (enabled && !present) issues.push({ issue: "enabled-missing", server, harness, scope, ...(project ? { project } : {}) });
+        if (!enabled && present) issues.push({ issue: "disabled-present", server, harness, scope, ...(project ? { project } : {}) });
+      };
+      if (state.global !== undefined) check("global", state.global);
+      for (const [project, enabled] of Object.entries(state.projects ?? {})) check("project", enabled, project);
+    }
+  }
+  return issues.sort((left, right) => `${left.server}:${left.harness}:${left.scope}:${left.project ?? ""}:${left.issue}`.localeCompare(`${right.server}:${right.harness}:${right.scope}:${right.project ?? ""}:${right.issue}`));
+}
+
+// The definition store: the shared catalog when present, otherwise the global Pi config.
+function mcpDefinitionStorePath(): string {
+  return existsSync(sharedCatalogPath) ? sharedCatalogPath : join(home, ".pi", "mcp", "mcp.json");
+}
+
+function mcpDefinitionStore(): Record<string, McpServer> {
+  const path = mcpDefinitionStorePath();
+  return existsSync(path) ? normalizeMcpFile(path) : {};
+}
+
+function claudeConfigPath(): string {
+  return join(home, ".claude.json");
+}
+
+function actualMcpNames(harness: string, scope: "project" | "global", project?: string): Set<string> {
+  try {
+    if (scope === "project") {
+      return harness === "claude" && project ? new Set(Object.keys(claudeLocalServers(claudeConfigPath(), resolvePortablePath(project)))) : new Set();
+    }
+    const path = mcpTargetPath(harness, "global");
+    return new Set(path && existsSync(path) ? Object.keys(normalizeMcpFile(path)) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function bindingTargetPath(harness: string, scope: "project" | "global"): string {
+  return scope === "project" ? claudeConfigPath() : mcpTargetPath(harness, "global") ?? mcpBindingsPath;
+}
+
+function mcpBindingCommand(enabled: boolean, args: string[]): void {
+  const apply = applyRequired(args);
+  const command = enabled ? "mcp-enable" : "mcp-disable";
+  const valuesAfter = (flag: string) => args.flatMap((arg, index) => arg === flag && args[index + 1] ? [args[index + 1]] : []);
+  const serverNames = [...new Set(valuesAfter("--server"))];
+  const targetNames = [...new Set(valuesAfter("--target"))];
+  if (!serverNames.length) fail(`${command} requires at least one --server <name>`);
+  if (serverNames.some((name) => name.startsWith("-") || /[\0\r\n]/.test(name))) fail("invalid MCP server name");
+  if (!targetNames.length) fail(`${command} requires at least one --target <harness>`);
+  for (const target of targetNames) if (!bindingHarnesses.includes(target)) fail(`unsupported binding target: ${target}`);
+  const projectValue = argumentValue(args, "--project");
+  if (projectValue && targetNames.some((target) => target !== "claude")) fail("--project bindings are supported for --target claude only (Claude local scope)");
+  const projectPath = projectValue ? resolvePortablePath(projectValue) : undefined;
+  if (projectPath && enabled && !(existsSync(projectPath) && statSync(projectPath).isDirectory())) fail(`project directory not found: ${projectPath}`);
+  const project = projectPath ? homePortablePath(projectPath) : undefined;
+  const scope: "project" | "global" = project ? "project" : "global";
+  const definitions = mcpDefinitionStore();
+  if (enabled) {
+    const unknown = serverNames.filter((name) => !definitions[name]);
+    if (unknown.length) fail(`MCP server not found in ${mcpDefinitionStorePath()}: ${unknown.join(", ")}`);
+  }
+  let bindings = readMcpBindings();
+  const changes = serverNames.flatMap((server) => targetNames.map((harness) => {
+    const before = desiredMcpBinding(bindings, server, harness, scope, project);
+    const present = actualMcpNames(harness, scope, project).has(server);
+    const operation = enabled && !present ? "add" : !enabled && present ? "remove" : "none";
+    bindings = setMcpBinding(bindings, server, harness, enabled, project);
+    return { server, harness, scope, ...(project ? { project } : {}), desired: enabled, before: before ?? null, present, operation, path: bindingTargetPath(harness, scope) };
+  }));
+  console.log(JSON.stringify({
+    action: command,
+    apply: false,
+    bindings: homePortablePath(mcpBindingsPath),
+    definitions: homePortablePath(mcpDefinitionStorePath()),
+    changes,
+    writes: [],
+  }, null, 2));
+  if (!apply) return;
+  const cliTargets = changes.filter((change) => change.operation !== "none" && change.scope === "global" && !directTargets.has(change.harness)).map((change) => change.harness);
+  const missingCli = [...new Set(cliTargets)].filter((harness) => !commandExists(harness));
+  if (missingCli.length) fail(`MCP target not installed: ${missingCli.join(", ")}`);
+  const paths = [...new Set(changes.filter((change) => change.operation !== "none").map((change) => change.path))];
+  const backupRoot = withBackup(command, [mcpBindingsPath, ...paths, mcpManifestPath], () => {
+    writeJsonAtomic(mcpBindingsPath, bindings);
+    for (const change of changes) {
+      if (change.operation === "none") continue;
+      if (change.scope === "project") {
+        if (change.operation === "add") renderClaudeLocal(change.path, projectPath!, { [change.server]: definitions[change.server] });
+        else removeClaudeLocal(change.path, projectPath!, [change.server]);
+      } else if (directTargets.has(change.harness)) {
+        if (change.operation === "add") renderDirectTarget(change.harness, change.path, { [change.server]: definitions[change.server] });
+        else removeDirectMcpServers(change.harness, change.path, [change.server]);
+      } else {
+        const harness = change.harness as "claude" | "grok" | "gemini";
+        run(change.operation === "add" ? mcpNativeCliCommand(harness, "global", change.server, definitions[change.server]) : mcpNativeCliRemoveCommand(harness, "global", change.server), { cwd: projectRoot(), quiet: true });
+      }
+      if (existsSync(change.path)) chmodSync(change.path, 0o600);
+    }
+    if (existsSync(mcpManifestPath)) writeJsonAtomic(mcpManifestPath, scanMcpManifest(mcpSources(), readMcpManifest()));
+  });
+  const applied = changes.filter((change) => change.operation !== "none").length;
+  console.log(`Recorded ${changes.length} binding(s) in ${mcpBindingsPath}; changed ${applied} config binding(s). Backup: ${backupRoot}`);
+}
+
+export function readSkillOverrides(path = skillOverridesPath): SkillOverrides {
+  if (!existsSync(path)) return { version: 1, skills: {} };
+  const value = readJson(path);
+  const invalid = () => new Error(`invalid skill overrides: ${path}`);
+  if (value?.version !== 1 || !value.skills || typeof value.skills !== "object" || Array.isArray(value.skills)) throw invalid();
+  for (const [name, entry] of Object.entries(value.skills as Record<string, any>)) {
+    if (!validSkillName(name) || !entry?.frontmatter || typeof entry.frontmatter !== "object" || Array.isArray(entry.frontmatter)) throw invalid();
+    for (const [key, item] of Object.entries(entry.frontmatter)) {
+      if (!validFrontmatterKey(key) || !["string", "number", "boolean"].includes(typeof item)) throw invalid();
+    }
+  }
+  return value as SkillOverrides;
+}
+
+function validFrontmatterKey(key: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(key) && key !== "name";
+}
+
+const frontmatterPattern = /^---(\r?\n)([\s\S]*?)\r?\n---(\r?\n|$)/;
+
+export function frontmatterValues(text: string): Record<string, unknown> | undefined {
+  const block = text.match(frontmatterPattern)?.[2];
+  if (block === undefined) return undefined;
+  try {
+    const parsed = Bun.YAML.parse(block);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Sets top-level scalar keys and leaves every other frontmatter line and the body byte-identical.
+export function applyFrontmatterOverrides(text: string, overrides: Record<string, SkillOverrideValue>): string {
+  const match = text.match(frontmatterPattern);
+  if (!match) throw new Error("SKILL.md has no frontmatter");
+  const eol = match[1];
+  const lines = match[2].split(/\r?\n/);
+  for (const [key, value] of Object.entries(overrides)) {
+    if (!validFrontmatterKey(key)) throw new Error(`invalid frontmatter override key: ${key}`);
+    const rendered = `${key}: ${typeof value === "string" ? JSON.stringify(value) : String(value)}`;
+    const index = lines.findIndex((line) => line === `${key}:` || line.startsWith(`${key}: `) || line.startsWith(`${key}:\t`));
+    if (index < 0) {
+      lines.push(rendered);
+      continue;
+    }
+    let end = index + 1;
+    while (end < lines.length && /^[ \t]/.test(lines[end])) end++;
+    lines.splice(index, end - index, rendered);
+  }
+  const result = `---${eol}${lines.join(eol)}${eol}---${match[3]}${text.slice(match[0].length)}`;
+  const values = frontmatterValues(result);
+  const wrong = Object.entries(overrides).filter(([key, value]) => values?.[key] !== value).map(([key]) => key);
+  if (wrong.length) throw new Error(`frontmatter override did not round-trip: ${wrong.join(", ")}`);
+  return result;
+}
+
+export function inspectSkillOverrides(overrides: SkillOverrides, canonicalDir = canonicalSkills): SkillOverrideIssue[] {
+  const issues: SkillOverrideIssue[] = [];
+  for (const [skill, entry] of Object.entries(overrides.skills).sort(([left], [right]) => left.localeCompare(right))) {
+    const path = join(canonicalDir, skill, "SKILL.md");
+    if (!existsSync(path)) {
+      issues.push({ issue: "skill-missing", skill, path });
+      continue;
+    }
+    const values = frontmatterValues(readFileSync(path, "utf8"));
+    if (!values) {
+      issues.push({ issue: "invalid-frontmatter", skill, path });
+      continue;
+    }
+    for (const [key, value] of Object.entries(entry.frontmatter)) {
+      if (values[key] !== value) issues.push({ issue: "override-missing", skill, key, path });
+    }
+  }
+  return issues;
+}
+
+// Returns the skills whose SKILL.md changed. Linked canonical skills are skipped so an override never writes into a source checkout.
+export function applySkillOverrides(overrides: SkillOverrides, canonicalDir = canonicalSkills, names?: Iterable<string>): { changed: string[]; skipped: string[] } {
+  const selected = names ? new Set(names) : undefined;
+  const changed: string[] = [], skipped: string[] = [];
+  for (const [skill, entry] of Object.entries(overrides.skills).sort(([left], [right]) => left.localeCompare(right))) {
+    if (selected && !selected.has(skill)) continue;
+    const directory = join(canonicalDir, skill);
+    const path = join(directory, "SKILL.md");
+    if (!existsSync(path)) continue;
+    if (lstatSync(directory).isSymbolicLink() || lstatSync(path).isSymbolicLink()) {
+      skipped.push(skill);
+      continue;
+    }
+    const text = readFileSync(path, "utf8");
+    const next = applyFrontmatterOverrides(text, entry.frontmatter);
+    if (next === text) continue;
+    const mode = statSync(path).mode & 0o777;
+    writeTextAtomic(path, next);
+    chmodSync(path, mode);
+    changed.push(skill);
+  }
+  return { changed, skipped };
+}
+
+function overrideValue(raw: string): SkillOverrideValue {
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  if (/^-?(?:0|[1-9]\d{0,14})$/.test(raw)) return Number(raw);
+  return raw;
+}
+
+function skillOverrideCommand(args: string[]): void {
+  const apply = applyRequired(args);
+  const valuesAfter = (flag: string) => args.flatMap((arg, index) => arg === flag && args[index + 1] ? [args[index + 1]] : []);
+  const names = [...new Set(valuesAfter("--skill"))];
+  for (const name of names) if (!validSkillName(name)) fail(`invalid skill name: ${name}`);
+  const assignments = valuesAfter("--set").map((raw) => {
+    const separator = raw.indexOf("=");
+    const key = raw.slice(0, separator);
+    if (separator < 1 || !validFrontmatterKey(key)) fail(`invalid --set value (expected <key>=<value>, not name): ${raw}`);
+    return [key, overrideValue(raw.slice(separator + 1))] as const;
+  });
+  if (assignments.length && !names.length) fail("skill-override --set requires at least one --skill <name>");
+  const overrides = readSkillOverrides();
+  for (const name of names) {
+    if (!assignments.length) {
+      if (!overrides.skills[name]) fail(`no override recorded for ${name}`);
+      continue;
+    }
+    if (!existsSync(join(canonicalSkills, name, "SKILL.md"))) fail(`canonical skill not found: ${name}`);
+    overrides.skills[name] = { frontmatter: sortedObject({ ...(overrides.skills[name]?.frontmatter ?? {}), ...Object.fromEntries(assignments) }) };
+  }
+  overrides.skills = sortedObject(overrides.skills);
+  const selected = names.length ? names : Object.keys(overrides.skills);
+  const pending = inspectSkillOverrides({ version: 1, skills: Object.fromEntries(selected.map((name) => [name, overrides.skills[name]])) });
+  console.log(JSON.stringify({
+    action: "skill-override",
+    apply: false,
+    overrides: homePortablePath(skillOverridesPath),
+    record: assignments.length ? Object.fromEntries(names.map((name) => [name, overrides.skills[name].frontmatter])) : {},
+    pending: pending.map((item) => ({ skill: item.skill, issue: item.issue, ...(item.key ? { key: item.key } : {}) })),
+    writes: [],
+  }, null, 2));
+  if (!apply) return;
+  const skillFiles = selected.map((name) => join(canonicalSkills, name, "SKILL.md")).filter(existsSync);
+  let result = { changed: [] as string[], skipped: [] as string[] };
+  const backupRoot = withBackup("skill override", [skillOverridesPath, ...skillFiles, skillManifestPath], () => {
+    if (assignments.length) writeJsonAtomic(skillOverridesPath, overrides);
+    result = applySkillOverrides(overrides, canonicalSkills, selected);
+    if (existsSync(skillManifestPath) && result.changed.length) writeJsonAtomic(skillManifestPath, currentSkillManifest());
+  });
+  if (result.skipped.length) console.log(`Skipped linked skill(s): ${result.skipped.join(", ")}`);
+  console.log(`Applied overrides to ${result.changed.length} skill(s). Overrides: ${skillOverridesPath}. Backup: ${backupRoot}`);
 }
 
 const supportedMcpTargets = ["codex", "claude", "pi", "grok", "opencode", "gemini", "hermes", "goose", "catalog"];
@@ -2200,7 +2700,10 @@ function mcpSync(args: string[]): void {
     } else fail(`unknown conflict resolution for ${name}: ${choice}`);
   }
   const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY && !args.includes("--non-interactive"));
-  let built = buildMcpSyncPlan(sourceBinding, targets, resolutions, interactive ? "interactive" : "non-interactive");
+  const bindings = readMcpBindings();
+  const bindingProject = effectiveScope === "project" ? homePortablePath(projectRoot()) : undefined;
+  const desired = (server: string, harness: string) => desiredMcpBinding(bindings, server, harness, effectiveScope as "project" | "global", bindingProject);
+  let built = buildMcpSyncPlan(sourceBinding, targets, resolutions, interactive ? "interactive" : "non-interactive", platform(), desired);
   if (interactive) {
     for (const conflict of built.plan.unresolvedConflicts) {
       console.log(`Conflict ${conflict.server}: fields=${conflict.differingFields.join(", ")}; env keys=${conflict.envKeys.join(", ") || "none"}; header keys=${conflict.headerKeys.join(", ") || "none"}; collisions=${conflict.collisions.join(", ") || "none"}`);
@@ -2214,13 +2717,14 @@ function mcpSync(args: string[]): void {
         if (variant) resolutions[conflict.server] = { action: "variant", variant: variant.id };
       }
     }
-    built = buildMcpSyncPlan(sourceBinding, targets, resolutions, "interactive");
+    built = buildMcpSyncPlan(sourceBinding, targets, resolutions, "interactive", platform(), desired);
   }
   console.log(`Source: ${source.harness}:${source.path} (${Object.keys(servers).length} servers); scope=${effectiveScope}`);
   console.log(`Missing: ${built.plan.inventory.missing.join(", ") || "none"}`);
   console.log(`Identical: ${built.plan.inventory.identical.join(", ") || "none"}`);
   console.log(`Conflicts: ${built.plan.inventory.conflicts.join(", ") || "none"}`);
   console.log(`Unsupported scope: ${unsupported.join(", ") || "none"}`);
+  console.log(`Disabled by binding: ${built.plan.skippedDisabled.map((item) => `${item.binding.split(":")[0]}:${item.server}`).join(", ") || "none"}`);
   console.log(JSON.stringify({ ...built.plan, apply }, null, 2));
   if (built.plan.status === "blocked-by-conflict") {
     process.exitCode = built.plan.exitCode;
@@ -2297,8 +2801,197 @@ function mcpRemove(args: string[]): void {
   console.log(`Removed ${count} MCP binding(s). Provenance: ${mcpManifestPath}. Backup: ${backupRoot}`);
 }
 
+type DashboardCell = { desired: boolean | null; present: boolean; status: "ok" | "drift" | "unmanaged" };
+export type DashboardStatus = {
+  generatedAt: string;
+  host: string;
+  skills: Array<{
+    name: string;
+    source: string | null;
+    sourceType: string | null;
+    sourceMissing: boolean;
+    overrides: Record<string, SkillOverrideValue>;
+    overridesApplied: boolean;
+    modelInvocation: "enabled" | "disabled";
+  }>;
+  mcp: {
+    definitions: string;
+    bindings: string;
+    columns: Array<{ harness: string; scope: "project" | "global"; project?: string }>;
+    rows: Array<{ server: string; inCatalog: boolean; cells: DashboardCell[] }>;
+  };
+  audit: { actionable: boolean; findings: StrictAuditFinding[] };
+  errors: string[];
+};
+
+// Collects names, sources and states only; definitions are read for their names, never their values.
+export function dashboardStatus(): DashboardStatus {
+  const errors: string[] = [];
+  const attempt = <T>(label: string, action: () => T, fallback: T): T => {
+    try { return action(); } catch (error) { errors.push(`${label}: ${(error as Error).message}`); return fallback; }
+  };
+  const overrides = attempt("skill overrides", () => readSkillOverrides(), { version: 1, skills: {} } as SkillOverrides);
+  const manifest = attempt("skills", () => currentSkillManifest(), { version: 1, skills: {} } as SkillManifest);
+  const skills = Object.entries(manifest.skills).map(([name, item]) => {
+    const values = attempt(`skill ${name}`, () => frontmatterValues(readFileSync(join(canonicalSkills, name, "SKILL.md"), "utf8")) ?? {}, {} as Record<string, unknown>);
+    const recorded = overrides.skills[name]?.frontmatter ?? {};
+    return {
+      name,
+      source: skillInstallSource(item),
+      sourceType: item.sourceType,
+      sourceMissing: Boolean(missingLocalSkillSource(item)),
+      overrides: recorded,
+      overridesApplied: Object.entries(recorded).every(([key, value]) => values[key] === value),
+      modelInvocation: values["disable-model-invocation"] === true ? "disabled" as const : "enabled" as const,
+    };
+  });
+  const bindings = attempt("MCP bindings", () => readMcpBindings(), { version: 1, servers: {} } as McpBindings);
+  const catalog = new Set(attempt("MCP definitions", () => Object.keys(mcpDefinitionStore()), [] as string[]));
+  const installed = new Set(detectedHarnesses().filter((item) => item.installed).map((item) => item.id));
+  const boundHarnesses = new Set(Object.values(bindings.servers).flatMap((states) => Object.keys(states)));
+  const columns: DashboardStatus["mcp"]["columns"] = bindingHarnesses
+    .filter((harness) => installed.has(harness) || boundHarnesses.has(harness) || existsSync(mcpTargetPath(harness, "global") ?? ""))
+    .map((harness) => ({ harness, scope: "global" as const }));
+  const projects = new Set([
+    ...Object.values(bindings.servers).flatMap((states) => Object.keys(states.claude?.projects ?? {})),
+    ...attempt("Claude local scope", () => claudeLocalProjects(claudeConfigPath()).map((project) => homePortablePath(project)), [] as string[]),
+  ]);
+  for (const project of [...projects].sort()) columns.push({ harness: "claude", scope: "project", project });
+  const actual = columns.map((column) => actualMcpNames(column.harness, column.scope, column.project));
+  const servers = new Set([...catalog, ...Object.keys(bindings.servers), ...actual.flatMap((names) => [...names])]);
+  const rows = [...servers].sort().map((server) => ({
+    server,
+    inCatalog: catalog.has(server),
+    cells: columns.map((column, index): DashboardCell => {
+      const desired = desiredMcpBinding(bindings, server, column.harness, column.scope, column.project) ?? null;
+      const present = actual[index].has(server);
+      return { desired, present, status: desired === null ? "unmanaged" : desired === present ? "ok" : "drift" };
+    }),
+  }));
+  const audit = attempt("strict audit", () => collectAudit(true).strictSummary!, { actionable: false, findings: [] } as StrictAuditSummary);
+  return {
+    generatedAt: new Date().toISOString(),
+    host: hostname(),
+    skills,
+    mcp: { definitions: homePortablePath(mcpDefinitionStorePath()), bindings: homePortablePath(mcpBindingsPath), columns, rows },
+    audit: { actionable: audit.actionable, findings: audit.findings.map((item) => ({ ...item, path: homePortablePath(item.path) })) },
+    errors,
+  };
+}
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
+}
+
+export function renderDashboardHtml(status: DashboardStatus): string {
+  const cell = (item: DashboardCell) => {
+    const actual = item.present ? "●" : "○";
+    const desired = item.desired === null ? "" : `<small>${item.desired ? "on" : "off"}</small>`;
+    const title = `${item.present ? "present" : "absent"}; desired ${item.desired === null ? "unmanaged" : item.desired ? "on" : "off"}`;
+    return `<td class="cell ${item.status}" title="${escapeHtml(title)}">${actual}${desired}</td>`;
+  };
+  const drift = status.mcp.rows.reduce((count, row) => count + row.cells.filter((item) => item.status === "drift").length, 0);
+  const pendingOverrides = status.skills.filter((skill) => !skill.overridesApplied).length;
+  const findings = status.audit.findings.map((item) => `<tr><td><code>${escapeHtml(item.code)}</code></td><td>${escapeHtml([item.server, item.skill, item.harness, item.scope, item.project, item.field, item.key, item.id].filter(Boolean).join(" · "))}</td><td><code>${escapeHtml(item.path)}</code></td></tr>`).join("");
+  const skills = status.skills.map((skill) => `<tr>
+<td>${escapeHtml(skill.name)}</td>
+<td>${skill.source ? `<code>${escapeHtml(skill.source)}</code>` : '<span class="muted">unknown</span>'}${skill.sourceMissing ? ' <span class="badge drift">source missing</span>' : ""}</td>
+<td>${Object.entries(skill.overrides).map(([key, value]) => `<code>${escapeHtml(key)}: ${escapeHtml(value)}</code>`).join(" ")}${Object.keys(skill.overrides).length && !skill.overridesApplied ? ' <span class="badge drift">not applied</span>' : ""}</td>
+<td>${skill.modelInvocation === "disabled" ? '<span class="badge">manual only</span>' : '<span class="muted">model</span>'}</td>
+</tr>`).join("");
+  const header = status.mcp.columns.map((column) => `<th>${escapeHtml(column.harness)}<br><small>${escapeHtml(column.scope === "global" ? "global" : column.project)}</small></th>`).join("");
+  const rows = status.mcp.rows.map((row) => `<tr><th scope="row">${escapeHtml(row.server)}${row.inCatalog ? "" : ' <span class="muted">(not in catalog)</span>'}</th>${row.cells.map(cell).join("")}</tr>`).join("");
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>harness-sync · ${escapeHtml(status.host)}</title>
+<style>
+:root { color-scheme: light dark; --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4; --ok: #15803d; --drift: #b91c1c; --soft: #f5f5f4; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0c0a09; --fg: #e7e5e4; --muted: #a8a29e; --line: #292524; --ok: #4ade80; --drift: #f87171; --soft: #1c1917; } }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; font: 14px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+h1 { font-size: 20px; margin: 0 0 4px; } h2 { font-size: 16px; margin: 32px 0 8px; }
+.summary { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+.stat { padding: 10px 14px; border: 1px solid var(--line); border-radius: 8px; min-width: 140px; }
+.stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+.wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+thead th { background: var(--soft); position: sticky; top: 0; font-weight: 600; }
+.cell { text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.cell small { margin-left: 4px; color: var(--muted); }
+.cell.ok { color: var(--ok); } .cell.drift { color: var(--drift); background: color-mix(in srgb, var(--drift) 12%, transparent); font-weight: 600; }
+.muted, small { color: var(--muted); }
+.badge { display: inline-block; padding: 0 6px; border-radius: 4px; border: 1px solid var(--line); font-size: 12px; }
+.badge.drift { color: var(--drift); border-color: var(--drift); }
+code { font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
+.clean { color: var(--ok); } .bad { color: var(--drift); }
+</style>
+</head>
+<body>
+<h1>harness-sync</h1>
+<div class="muted">${escapeHtml(status.host)} · generated ${escapeHtml(status.generatedAt)} · read-only</div>
+<div class="summary">
+<div class="stat"><b class="${status.audit.actionable ? "bad" : "clean"}">${status.audit.findings.length}</b>strict findings</div>
+<div class="stat"><b class="${drift ? "bad" : "clean"}">${drift}</b>MCP binding drift</div>
+<div class="stat"><b>${status.skills.length}</b>skills</div>
+<div class="stat"><b class="${pendingOverrides ? "bad" : "clean"}">${pendingOverrides}</b>overrides not applied</div>
+</div>
+${status.errors.length ? `<h2>Errors</h2><ul>${status.errors.map((error) => `<li>${escapeHtml(error)}</li>`).join("")}</ul>` : ""}
+<h2>Strict audit</h2>
+${findings ? `<div class="wrap"><table><thead><tr><th>Code</th><th>Subject</th><th>Path</th></tr></thead><tbody>${findings}</tbody></table></div>` : '<p class="clean">Clean.</p>'}
+<h2>MCP bindings</h2>
+<p class="muted">● present · ○ absent · on/off = desired state in <code>${escapeHtml(status.mcp.bindings)}</code>; definitions from <code>${escapeHtml(status.mcp.definitions)}</code>. Red cells differ from the desired state.</p>
+<div class="wrap"><table><thead><tr><th>Server</th>${header}</tr></thead><tbody>${rows}</tbody></table></div>
+<h2>Skills</h2>
+<div class="wrap"><table><thead><tr><th>Skill</th><th>Source</th><th>Overrides</th><th>Invocation</th></tr></thead><tbody>${skills}</tbody></table></div>
+</body>
+</html>
+`;
+}
+
+function tailscaleAddress(): string {
+  if (!commandExists("tailscale")) fail("--tailscale requires the tailscale CLI");
+  const result = Bun.spawnSync(["tailscale", "ip", "-4"], { stdout: "pipe", stderr: "pipe" });
+  const address = result.stdout.toString().split(/\s+/).find((line) => {
+    const match = line.match(/^100\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+    return match && Number(match[1]) >= 64 && Number(match[1]) <= 127;
+  });
+  if (result.exitCode !== 0 || !address) fail("could not determine the Tailscale IPv4 address (tailscale ip -4)");
+  return address;
+}
+
+function serveDashboard(args: string[]): void {
+  const portValue = argumentValue(args, "--port") ?? "4317";
+  if (!/^\d{1,5}$/.test(portValue) || Number(portValue) > 65535) fail("--port must be 0-65535");
+  const hostnameValue = args.includes("--tailscale") ? tailscaleAddress() : "127.0.0.1";
+  const headers = {
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+  };
+  const server = Bun.serve({
+    hostname: hostnameValue,
+    port: Number(portValue),
+    fetch(request) {
+      if (request.method !== "GET" && request.method !== "HEAD") return new Response("read-only\n", { status: 405, headers: { ...headers, allow: "GET, HEAD" } });
+      const { pathname } = new URL(request.url);
+      if (pathname === "/api/status") return Response.json(dashboardStatus(), { headers });
+      if (pathname === "/") {
+        return new Response(renderDashboardHtml(dashboardStatus()), {
+          headers: { ...headers, "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" },
+        });
+      }
+      return new Response("not found\n", { status: 404, headers });
+    },
+  });
+  console.log(`Serving read-only dashboard at http://${hostnameValue}:${server.port}/`);
+}
+
 function usage(): void {
-  console.log(`harness-sync [audit|doctor|portable-config|init|instructions|add|remove|update|mcp|mcp-remove]
+  console.log(`harness-sync [audit|doctor|portable-config|init|instructions|add|remove|update|skill-override|mcp|mcp-remove|mcp-enable|mcp-disable|serve]
 
 Commands:
   audit [--strict] [--json]
@@ -2311,17 +3004,26 @@ Commands:
   add <source|npx skills add ...> [--skill <name>...] [--full-depth]
   remove <skill>
   update [skill ...]
+  skill-override [--skill <name>]... [--set <key>=<value>]...
   mcp [--from auto|catalog|<harness>|<path>] [--target <harness>]...
       [--scope auto|project|global] [--server <name>]
       [--resolve <server>=source|target:<harness>|merge|skip]...
       [--direct] [--non-interactive]
   mcp-remove --server <name>... --target <harness>... --scope project|global
+  mcp-enable --server <name>... --target <harness>... [--project <path>]
+  mcp-disable --server <name>... --target <harness>... [--project <path>]
+  serve [--port <port>] [--tailscale]
 
 Harnesses: ${harnesses.map((item) => item.id).join(", ")}
 MCP sync also accepts catalog as a target. Repeat --server/--target flags for removal.
 Recommended: audit
 Strict audit exits 1 for actionable findings; default audit reports without failing.
 Audit checks the complete inventory, including user state; it has no scope filter.
+Bindings (default ~/.agents/mcp/bindings.json) record the desired state; --project uses Claude local scope.
+Skill overrides (default ~/.agents/skills-overrides.json) are reapplied after add and update.
+Relocate the catalog, bindings and overrides with ~/.agents/harness-sync/config.json "paths"
+(mcpCatalog, mcpBindings, skillOverrides) or HARNESS_SYNC_MCP_CATALOG, HARNESS_SYNC_MCP_BINDINGS, HARNESS_SYNC_SKILL_OVERRIDES.
+serve is read-only and binds 127.0.0.1, or only the Tailscale IPv4 address with --tailscale.
 Run a mutation command without --apply for a plan. Writes require --apply --confirmed.`);
 }
 
@@ -2342,6 +3044,10 @@ export function main(argv = process.argv.slice(2)): void {
     if (command === "update") return updateSkills(args, args);
     if (command === "mcp") return mcpSync(args);
     if (command === "mcp-remove") return mcpRemove(args);
+    if (command === "mcp-enable") return mcpBindingCommand(true, args);
+    if (command === "mcp-disable") return mcpBindingCommand(false, args);
+    if (command === "skill-override") return skillOverrideCommand(args);
+    if (command === "serve") return serveDashboard(args);
     usage();
     fail(`unknown command: ${command}`);
   } catch (error) {

@@ -19,7 +19,10 @@ Read the matching sections of [behavior](references/behavior.md) before planning
 | Task | Sections |
 | --- | --- |
 | Add, update, remove, or initialize skills; inspect marketplace skills | Sources; Portable links; State and recovery; Harnesses |
-| Synchronize or remove MCP bindings; initialize MCP provenance | MCP; State and recovery; Harnesses |
+| Synchronize or remove MCP bindings; initialize MCP provenance | MCP; Desired MCP state; State and recovery; Harnesses |
+| Turn a server on or off for a harness or project | Desired MCP state; State and recovery |
+| Keep a local frontmatter change, such as manual-only invocation | Skill overrides; Sources |
+| Show status in a browser | Dashboard |
 | Synchronize instructions | Instruction files; Portable links; State and recovery |
 | Separate Syncthing source config from machine-local targets | Portable configuration; Shared hook configuration; State and recovery |
 | Audit findings, shared hooks, or run strict verification | Audit; Shared hook configuration; Sources for skill findings; MCP for server findings; Instruction files for entrypoint findings |

@@ -1298,7 +1298,7 @@ describe("CLI", () => {
       stderr: "pipe",
     });
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.toString()).toContain("harness-sync [audit|doctor|portable-config|init|instructions|add|remove|update|mcp|mcp-remove]");
+    expect(result.stdout.toString()).toContain("harness-sync [audit|doctor|portable-config|init|instructions|add|remove|update|skill-override|mcp|mcp-remove|mcp-enable|mcp-disable|serve]");
     expect(result.stderr.toString()).toBe("");
   });
 });

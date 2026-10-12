@@ -22,6 +22,9 @@ specific home directory.
 - Portable source files rendered into machine-local synchronized config targets
 - Secret-free host reports for Linux/macOS comparison
 - Marketplace skill discovery without bulk copying plugin contents
+- Desired MCP state per server, harness, and scope, including Claude local scope
+- Local skill frontmatter overrides that survive reinstalls
+- A read-only status dashboard
 - Backups and automatic recovery when an apply fails
 
 OpenCode reads the canonical `.agents` directory directly. Harness Sync does not
@@ -206,6 +209,9 @@ Run another audit after every apply.
 | `update` | Reinstall tracked skills from their recorded sources. |
 | `mcp` | Compare MCP definitions and prepare selected synchronization operations. |
 | `mcp-remove` | Prepare removal of named MCP servers from exact harnesses and scope. |
+| `mcp-enable` / `mcp-disable` | Record the desired state of a server for a harness, globally or for one project, and apply it. |
+| `skill-override` | Record frontmatter overrides for canonical skills and reapply them. |
+| `serve` | Serve a read-only status page on localhost or the Tailscale address. |
 
 Show the built-in summary with:
 
@@ -232,7 +238,21 @@ bun run scripts/harness-sync.ts update
 ```
 
 Skills with unknown provenance are reported and skipped. Harness Sync does not
-invent an upstream source from a matching name.
+invent an upstream source from a matching name. A local source path that no
+longer exists is reported and skipped; the canonical copy stays as it is.
+
+Keep local frontmatter changes, such as manual-only invocation, in
+`~/.agents/skills-overrides.json` instead of editing installed files by hand:
+
+```bash
+bun run scripts/harness-sync.ts skill-override \
+  --skill example-skill \
+  --set disable-model-invocation=true
+```
+
+`add` and `update` reapply recorded overrides after every install, and
+`audit --strict` reports an override that is no longer present. Run
+`skill-override --apply --confirmed` without `--set` to restore them all.
 
 Marketplace caches from Claude, Codex, and Grok are discovery sources only. If
 a skill belongs to a plugin that also provides hooks, MCP servers, agents, or
@@ -297,6 +317,39 @@ A same-name semantic difference is a conflict. Resolve each conflict explicitly:
 `merge` is accepted only when fields do not collide. An unresolved conflict in
 non-interactive mode exits with code 2 and performs no writes.
 
+### Desired state
+
+`~/.agents/mcp/bindings.json` records which servers belong in which harness.
+It contains names and booleans only; definitions and secrets stay in the shared
+catalog `~/.agents/mcp/mcp.json`.
+
+```json
+{
+  "version": 1,
+  "servers": {
+    "example-server": {
+      "claude": { "global": false, "projects": { "~/projects/app": true } }
+    }
+  }
+}
+```
+
+Change it with the binding commands, which also apply the change:
+
+```bash
+bun run scripts/harness-sync.ts mcp-disable --server example-server --target claude
+bun run scripts/harness-sync.ts mcp-enable --server example-server --target claude \
+  --project ~/projects/app
+```
+
+A Claude project binding uses Claude local scope
+(`~/.claude.json` → `projects[<path>].mcpServers`), so a secret-bearing
+definition never enters the repository. `mcp` never adds a server to a binding
+recorded as disabled; the plan lists it under `skippedDisabled` with reason
+`disabled-by-binding`. `audit` reports every difference between the recorded
+and actual state. Servers without a recorded binding keep the default sync
+behavior.
+
 Harness Sync also recognizes the optional
 `agent-mcp-from-pi <server-name>` launcher in any harness config. It
 can compare the effective Pi definition and, with `--direct`, replace a
@@ -318,6 +371,9 @@ need this adapter.
 - A project MCP file with likely secret literals must already be gitignored.
 - Native configuration files are returned to mode `0600` after writes.
 - Unrelated servers, fields, and configuration are preserved.
+- `serve` is read-only, binds to `127.0.0.1` (or only the Tailscale IPv4
+  address with `--tailscale`), and shows server names and key states, never
+  environment or header values.
 
 Skill sources and MCP commands are treated as untrusted input. The CLI accepts
 known source shapes and argument lists; it does not execute arbitrary shell text
@@ -332,10 +388,26 @@ provided as a skill source.
 | MCP provenance | `${XDG_STATE_HOME:-~/.local/state}/harness-sync/mcps.json` |
 | Backups | `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/` |
 | Optional local MCP catalog | `./mcp.json` |
+| Shared MCP catalog (secrets, `0600`, not in Git) | `~/.agents/mcp/mcp.json` |
+| MCP desired state (secret-free) | `~/.agents/mcp/bindings.json` |
+| Skill frontmatter overrides (secret-free) | `~/.agents/skills-overrides.json` |
+| Path overrides for the three files above | `~/.agents/harness-sync/config.json` (`paths.mcpCatalog`, `paths.mcpBindings`, `paths.skillOverrides`) or `HARNESS_SYNC_MCP_CATALOG` / `HARNESS_SYNC_MCP_BINDINGS` / `HARNESS_SYNC_SKILL_OVERRIDES` |
 
 State directories use mode `0700` and state files `0600`. Backup copies keep
 their source modes. The newest 10 timestamped backups are kept; manually named
 backup directories are left alone.
+
+## Dashboard
+
+```bash
+bun run scripts/harness-sync.ts serve            # http://127.0.0.1:4317/
+bun run scripts/harness-sync.ts serve --tailscale --port 4317
+```
+
+The page shows skills with their source, overrides, and invocation mode; an MCP
+matrix of server × harness × scope with desired and actual state; and the strict
+audit findings. `/api/status` returns the same data as JSON. Every request reads
+the current state; the server never writes.
 
 ## Development
 

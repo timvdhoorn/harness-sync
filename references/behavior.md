@@ -16,6 +16,7 @@ Strict audit is an inventory check, not a scoped synchronization plan or proof t
 - Backups: `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/<timestamp>`, directory mode `0700`; copies keep their source file modes. Each successful apply keeps the newest 10 timestamped backups. Manually named directories there are never pruned.
 - `npx skills` locks remain evidence, not desired state.
 - Skill provenance lives in `${XDG_STATE_HOME:-~/.local/state}/harness-sync/skills.json`. It records source, exact installed content version, current content hash, and timestamps. `init` imports trustworthy metadata from existing `npx skills` locks and marks everything else as unknown rather than guessing.
+- Desired MCP state lives in `~/.agents/mcp/bindings.json` beside the shared catalog; skill frontmatter overrides live in `~/.agents/skills-overrides.json`. Both are secret-free, shared through Syncthing, and written mode `0600`. These are defaults: `~/.agents/harness-sync/config.json` may set `paths.mcpCatalog`, `paths.mcpBindings` and `paths.skillOverrides` (`~/` allowed), and `HARNESS_SYNC_MCP_CATALOG`, `HARNESS_SYNC_MCP_BINDINGS` and `HARNESS_SYNC_SKILL_OVERRIDES` override the file. Callers that own these files pass the same paths.
 - MCP provenance lives in `${XDG_STATE_HOME:-~/.local/state}/harness-sync/mcps.json`. It records semantic hashes and config locations without secret values. Infer upstreams only for remote URLs and recognizable npm, PyPI, or container launchers; keep other sources unknown. Mark same-name semantic differences as conflicts.
 - Back up every affected path before mutation. Restore automatically when apply fails; the error names the backup, and says so when the restore itself failed.
 - Writes to a symlinked config land in its real file and keep the link. A dangling symlink blocks the write.
@@ -28,6 +29,14 @@ Detect Codex, Claude Code, Pi, Grok, OpenCode, Gemini, Hermes, and Goose. Defaul
 OpenCode discovers canonical `~/.agents/skills` itself. Keep it out of the `npx skills --agent` targets and do not create `~/.config/opencode/skills` as a second adapter. Audit a legacy symlink that resolves to the canonical directory as redundant drift; back it up and remove the symlink only after the reviewed plan authorizes that exact path. Preserve a real OpenCode skill directory because it may contain intentional runtime-specific overrides.
 
 Use native MCP CLIs for Claude, Grok, and Gemini. Render Codex TOML, Pi JSON, OpenCode JSON, Hermes YAML, and Goose YAML while preserving unrelated config. Detect OpenCode stable and v2 shapes separately. After every native write, keep the target config private with mode `0600`.
+
+## Skill overrides
+
+An override is a top-level scalar frontmatter key recorded for one canonical skill, such as `disable-model-invocation: true`. Record it with `skill-override --skill <name> --set <key>=<value>`; `true`, `false`, and integers become YAML scalars, anything else a string. `name` is not overridable. Applying rewrites only the selected key lines and keeps the rest of `SKILL.md` byte-identical; the result must parse back to the recorded values.
+
+`add` and `update` reapply the overrides of every installed or reinstalled skill inside the same backup. `skill-override --apply --confirmed` without `--set` restores all recorded overrides. A canonical skill that is a symlink is skipped so an override never writes into a source checkout. Strict audit reports `skill-override-override-missing` for an installed skill whose frontmatter differs; an override for a skill absent on this machine stays informational.
+
+`update` reports a local install source that no longer exists as skipped and leaves that canonical copy unchanged. Record the skill's new source with `add` when one exists.
 
 ## Portable links
 
@@ -120,4 +129,18 @@ Every dry run emits a JSON plan with `apply: false` and `writes: []`. It contain
 
 Use `mcp --target <codex|claude|pi|grok|opencode|gemini|hermes|goose> --server <name>` to narrow a plan. Target eligibility follows the Harnesses section.
 
+### Desired MCP state
+
+The bindings file records, per server and harness, `global: true|false` and, for Claude only, `projects: { "<~/path>": true|false }`. A missing entry means unmanaged: sync and audit treat it as before. Definitions come from the shared catalog, otherwise the global Pi config; the bindings file holds no definitions.
+
+`mcp-enable` and `mcp-disable --server <name>... --target <harness>... [--project <path>]` update the bindings file and converge the selected config in the same backup: enabling adds an absent server from the catalog, disabling removes a present one, and an already-matching binding changes only the file. A project binding renders Claude local scope, `~/.claude.json` → `projects[<absolute path>].mcpServers`, with a verified direct write that leaves every other key unchanged. Global Claude, Grok, and Gemini use their native CLIs; the other harnesses use the direct renderers.
+
+`mcp` reads the bindings for its effective scope; project scope looks up the Git root's `~/`-relative path. A server disabled for a target is left out of that target's comparison, so it is never added, overwritten, or counted as a conflict, and the plan lists it under `skippedDisabled` with reason `disabled-by-binding`. Removing an unwanted binding remains an explicit `mcp-disable` or `mcp-remove`.
+
+Strict audit reports `mcp-binding-disabled-present`, `mcp-binding-enabled-missing`, `mcp-binding-unknown-server` (enabled but absent from the catalog), and `mcp-bindings-invalid`, with server, harness, scope, and project.
+
 Use repeated `mcp-remove --server <name> --target <harness> --scope project|global` flags to remove exact bindings. Scope is mandatory. The dry run lists every affected path, missing binding, and native renderer without secret values. Removal preserves unrelated servers and unknown fields, backs up every affected config and the provenance manifest, restores them on failure, and refreshes provenance after success.
+
+## Dashboard
+
+`serve [--port <port>] [--tailscale]` starts a read-only page (`/`) and its JSON (`/api/status`); default port 4317. It binds `127.0.0.1`; `--tailscale` binds only the address from `tailscale ip -4` and fails when that address is unavailable. Each request recomputes skills with source, overrides and invocation mode, the MCP matrix of server × harness × scope with desired and actual state, and the strict audit findings. Responses contain names, paths, and states only; other methods return 405.
