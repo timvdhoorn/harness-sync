@@ -391,6 +391,7 @@ provided as a skill source.
 | Shared MCP catalog (secrets, `0600`, not in Git) | `~/.agents/mcp/mcp.json` |
 | MCP desired state (secret-free) | `~/.agents/mcp/bindings.json` |
 | Skill frontmatter overrides (secret-free) | `~/.agents/skills-overrides.json` |
+| Path overrides for the three files above | `~/.agents/harness-sync/config.json` (`paths.mcpCatalog`, `paths.mcpBindings`, `paths.skillOverrides`) or `HARNESS_SYNC_MCP_CATALOG` / `HARNESS_SYNC_MCP_BINDINGS` / `HARNESS_SYNC_SKILL_OVERRIDES` |
 
 State directories use mode `0700` and state files `0600`. Backup copies keep
 their source modes. The newest 10 timestamped backups are kept; manually named

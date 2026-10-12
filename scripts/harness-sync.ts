@@ -181,8 +181,24 @@ const canonicalSkills = join(home, ".agents", "skills");
 const skillManifestPath = join(stateRoot, "skills.json");
 const mcpManifestPath = join(stateRoot, "mcps.json");
 const portableConfigManifestPath = join(home, ".agents", "harness-sync", "portable-configs.json");
-const mcpBindingsPath = join(home, ".agents", "mcp", "bindings.json");
-const skillOverridesPath = join(home, ".agents", "skills-overrides.json");
+const pathConfigFile = join(home, ".agents", "harness-sync", "config.json");
+
+/** Optional path overrides: env first, then `~/.agents/harness-sync/config.json` `paths`, then the default. */
+function configuredPath(envName: string, key: string, fallback: string): string {
+  let configured: unknown = process.env[envName];
+  if (!configured && existsSync(pathConfigFile)) {
+    try {
+      configured = (JSON.parse(readFileSync(pathConfigFile, "utf8")) as { paths?: Record<string, unknown> }).paths?.[key];
+    } catch {
+      throw new Error(`invalid JSON in ${pathConfigFile}`);
+    }
+  }
+  if (typeof configured !== "string" || !configured) return fallback;
+  return configured === "~" || configured.startsWith("~/") ? join(home, configured.slice(1)) : configured;
+}
+
+const mcpBindingsPath = configuredPath("HARNESS_SYNC_MCP_BINDINGS", "mcpBindings", join(home, ".agents", "mcp", "bindings.json"));
+const skillOverridesPath = configuredPath("HARNESS_SYNC_SKILL_OVERRIDES", "skillOverrides", join(home, ".agents", "skills-overrides.json"));
 const cwd = process.cwd();
 
 export const harnesses: Harness[] = [
@@ -609,7 +625,7 @@ function mcpInventory(path: string): string[] {
   try { return Object.keys(normalizeMcpFile(path)); } catch { return []; }
 }
 
-const sharedCatalogPath = join(home, ".agents", "mcp", "mcp.json");
+const sharedCatalogPath = configuredPath("HARNESS_SYNC_MCP_CATALOG", "mcpCatalog", join(home, ".agents", "mcp", "mcp.json"));
 
 // Launcher bindings resolve to the shared catalog when present, otherwise to the global Pi config.
 function launcherSource<T extends { source: McpSource }>(loaded: T[]): T | undefined {
@@ -3003,8 +3019,10 @@ MCP sync also accepts catalog as a target. Repeat --server/--target flags for re
 Recommended: audit
 Strict audit exits 1 for actionable findings; default audit reports without failing.
 Audit checks the complete inventory, including user state; it has no scope filter.
-Bindings in ~/.agents/mcp/bindings.json record the desired state; --project uses Claude local scope.
-Skill overrides in ~/.agents/skills-overrides.json are reapplied after add and update.
+Bindings (default ~/.agents/mcp/bindings.json) record the desired state; --project uses Claude local scope.
+Skill overrides (default ~/.agents/skills-overrides.json) are reapplied after add and update.
+Relocate the catalog, bindings and overrides with ~/.agents/harness-sync/config.json "paths"
+(mcpCatalog, mcpBindings, skillOverrides) or HARNESS_SYNC_MCP_CATALOG, HARNESS_SYNC_MCP_BINDINGS, HARNESS_SYNC_SKILL_OVERRIDES.
 serve is read-only and binds 127.0.0.1, or only the Tailscale IPv4 address with --tailscale.
 Run a mutation command without --apply for a plan. Writes require --apply --confirmed.`);
 }

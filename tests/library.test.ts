@@ -103,6 +103,31 @@ describe("MCP bindings", () => {
     expect(sync.stdout).not.toContain(headerSecret);
   });
 
+  test("paths from ~/.agents/harness-sync/config.json relocate the catalog and bindings", () => {
+    const root = fixture();
+    mkdirSync(join(root, ".agents", "library"), { recursive: true });
+    writeFileSync(join(root, ".agents", "library", "servers.json"), readFileSync(join(root, ".agents", "mcp", "mcp.json")));
+    rmSync(join(root, ".agents", "mcp"), { recursive: true });
+    mkdirSync(join(root, ".agents", "harness-sync"), { recursive: true });
+    writeFileSync(join(root, ".agents", "harness-sync", "config.json"), JSON.stringify({ paths: { mcpCatalog: "~/.agents/library/servers.json", mcpBindings: "~/.agents/library/bindings.json" } }));
+    const applied = cli(root, "mcp-disable", "--server", "example-server", "--target", "claude", "--apply", "--confirmed");
+    expect(applied.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(join(root, ".agents", "library", "bindings.json"), "utf8")).servers["example-server"].claude.global).toBe(false);
+    expect(() => readFileSync(join(root, ".agents", "mcp", "bindings.json"))).toThrow();
+    const sync = cli(root, "mcp", "--from", "catalog", "--target", "claude", "--scope", "global", "--non-interactive");
+    expect(planJson(sync.stdout).operations.map((operation: any) => operation.server)).toEqual(["remote-server"]);
+  });
+
+  test("an environment variable overrides the configured bindings path", () => {
+    const root = fixture();
+    const result = Bun.spawnSync([process.execPath, "run", script, "mcp-disable", "--server", "example-server", "--target", "claude", "--apply", "--confirmed"], {
+      cwd: join(root, "projects", "app"),
+      env: { ...cliEnv(root), HARNESS_SYNC_MCP_BINDINGS: join(root, "custom-bindings.json") },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(join(root, "custom-bindings.json"), "utf8")).version).toBe(1);
+  });
+
   test("mcp-enable --project renders Claude local scope and preserves the rest of the config", () => {
     const root = fixture();
     const project = join(root, "projects", "app");
