@@ -1,0 +1,80 @@
+# Harness Sync behavior
+
+## Audit
+
+`audit` reports the current machine and working project's state without writing files. Its default exit status does not turn reported drift into a failure. Use `audit --strict --json` when the caller needs a failing check for actionable findings; `--json` remains optional.
+
+Strict mode checks the same complete inventory as the default audit. Missing canonical storage, broken or wrong links, drifted copies, invalid canonical skills, incompatible MCP placement, missing launcher dependencies, and same-scope MCP conflicts fail the check. Instruction conflicts and missing Claude entrypoints for existing canonical instructions also fail. Unknown provenance, matching copies, valid untracked skills, marketplace candidates, absent optional harness directories, and locations without canonical instructions remain informational.
+
+Strict JSON adds `strict.actionable` and `strict.findings`, with finding codes, paths, and applicable server names, field names, or scopes. Both audit modes redact MCP finding values; config paths, server names, and field names identify the affected binding without printing launcher arguments or environment values.
+
+Strict audit is an inventory check, not a scoped synchronization plan or proof that a running harness loaded its configuration. It has no scope filter. Keep it opt-in for machine checks; repository CI should not depend on unrelated user-level state. After a narrow change, verify the selected plan separately and account for unrelated findings without expanding the authorized task.
+
+## State and recovery
+
+- Canonical skills: `~/.agents/skills`.
+- Backups: `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/<timestamp>`; directory mode `0700`, files `0600`.
+- `npx skills` locks remain evidence, not desired state.
+- Skill provenance lives in `${XDG_STATE_HOME:-~/.local/state}/harness-sync/skills.json`. It records source, exact installed content version, current content hash, and timestamps. `init` imports trustworthy metadata from existing `npx skills` locks and marks everything else as unknown rather than guessing.
+- MCP provenance lives in `${XDG_STATE_HOME:-~/.local/state}/harness-sync/mcps.json`. It records semantic hashes and config locations without secret values. Infer upstreams only for remote URLs and recognizable npm, PyPI, or container launchers; keep other sources unknown. Mark same-name semantic differences as conflicts.
+- Back up every affected path before mutation. Restore automatically when apply fails.
+
+## Harnesses
+
+Detect Codex, Claude Code, Pi, Grok, OpenCode, Gemini, Hermes, and Goose. Default mutation targets are installed harnesses. An explicitly selected target with a direct native renderer may be updated without its CLI; CLI-backed targets still require the executable. OMP is outside scope.
+
+OpenCode discovers canonical `~/.agents/skills` itself. Keep it out of the `npx skills --agent` targets and do not create `~/.config/opencode/skills` as a second adapter. Audit a legacy symlink that resolves to the canonical directory as redundant drift; back it up and remove the symlink only after the reviewed plan authorizes that exact path. Preserve a real OpenCode skill directory because it may contain intentional runtime-specific overrides.
+
+Use native MCP CLIs for Claude, Grok, and Gemini. Render Codex TOML, Pi JSON, OpenCode JSON, Hermes YAML, and Goose YAML while preserving unrelated config. Detect OpenCode stable and v2 shapes separately. After every native write, keep the target config private with mode `0600`.
+
+## Shared hook configuration
+
+Treat hooks loaded from a synchronized settings file as cross-machine configuration, even when another harness loads them through compatibility behavior. Inventory every hook command before changing that file. Absolute home paths under `/Users/<name>` or `/home/<name>` are non-portable drift; use a shell-expanded `${HOME}` path when the hook format supports it. Symlink text does not expand home variables.
+
+Keep machine-local binaries out of shared hook settings. When an optional helper is intentionally shared, guard its executable or script lookup and return the harness's harmless success shape when it is absent. A missing optional helper must not block prompts. Remove a hook only when the reviewed plan identifies its exact event and command, and back up both the settings file and any script being removed.
+
+After a hook change, validate the settings syntax, confirm that the removed command and foreign home literals are absent, then start each affected harness from an unrelated directory on every named machine and submit a harmless prompt. A successful config parse or file sync is not evidence that the harness accepted a turn. If a named machine is unavailable, report that verification gap instead of claiming cross-machine completion.
+
+## Portable configuration
+
+Treat a synchronized source and a harness-owned target as separate artifacts. Register the source and target with `portable-config register`; seed a new source from a reviewed existing target only after its hook portability check passes. The manifest stores home-relative `~/` locations and contains no config values. Registration adds the generated target as an exact root-relative entry in the enclosing Syncthing `.stignore`.
+
+Render with `portable-config render`. Rendering validates JSON and shared hooks, backs up the target and ignore file, copies without interpolating `~` or `${HOME}`, writes mode `0600`, and rolls back on any remaining source, drift, or ignore finding. This preserves format-specific expansion: shell hook commands may expand `${HOME}`, symlink targets remain relative, executables resolve through `PATH`, and formats without expansion receive a machine-local rendered value.
+
+Run `doctor --strict --json` on each named host. Compare host, platform, architecture, installed harnesses, hook findings and portable-config findings; the report omits config values and commands. Zero findings proves local rendering and portability, not runtime loading. Follow with the Shared hook configuration prompt check. An unreachable host remains an explicit verification gap.
+
+## Instruction files
+
+Use a relative `CLAUDE.md` link for shared-only instructions. When Claude-specific imports or rules are needed, preserve a real wrapper importing the canonical `AGENTS.md`. The inspector recognizes a direct standalone import outside code fences that resolves to the canonical file; it does not execute or recursively expand imports. Unrecognized real files remain conflicts requiring reviewed replacement and backup. If `AGENTS.md` points to `CLAUDE.md`, preserve a real canonical file before changing links.
+
+User scope checks `~/AGENTS.md` and, when present, `~/.agents/AGENTS.md` with `~/.claude/CLAUDE.md`. Other native runtime adapters require separate loader verification. Grok needs a native global rule, such as `~/.grok/rules/shared.md` linked to `../../.agents/AGENTS.md`. Preserve runtime-specific configuration and verify loading from an unrelated working directory; a Claude import alone is not loader proof for another harness.
+
+## Sources
+
+Accept local paths, GitHub/GitLab repositories and tree URLs, arbitrary git URLs supported by `npx skills`, direct skill/archive URLs, `skills.sh/<owner>/<repo>/<skill>`, and allowlisted `npx skills add ...` commands. Local sources copy by default; link only when explicitly requested.
+
+Canonical skill directories must be standalone. Audit every canonical skill recursively and report any nested `SKILL.md` as `embedded-skill`. After `add` or `update`, reject and roll back an affected skill with embedded skill roots. For a repository whose root skill bundles the repository, select the intended standalone directory with a tree URL. Record that exact install source separately from upstream metadata and reuse it for updates so a later update cannot fall back to the repository root.
+
+Marketplace discovery is read-only. Deduplicate identical cached skills across Claude, Codex, and Grok. Identify the marketplace and plugin, then resolve keep-native, selected-copy, or ignore from the request; ask when that choice is missing. Native plugin remains recommended when the plugin also supplies hooks, MCP, agents, or other resources. Copy only the selected standalone skill through the existing `add` flow within the reviewed authorization. Explain conflicts before replacing a canonical skill.
+
+## MCP
+
+Default source and scope are `auto`. Sources may be Codex or Grok TOML; Claude, Pi, OpenCode, or Gemini JSON/JSONC; Hermes or Goose YAML; the repository-local `mcp.json` catalog; or an explicit path. The catalog is gitignored, retains complete definitions including environment values, and is used explicitly with `--from catalog` or `--target catalog`. Prefer project sources, then global sources. Pi uses the global `~/.pi/mcp/mcp.json` and has no project scope. Infer an explicit path inside the Git root as project scope. Never silently change project/global scope; report unsupported Pi, Hermes, or Goose project scope instead of writing globally.
+
+Treat MCP launchers fingerprinted to a ChatGPT/Codex application bundle as machine-local, macOS-only, and Codex-owned. This includes the bundled `cua_node/bin/node_repl` host and the `SkyComputerUseClient mcp` executable inside `Codex Computer Use.app`. Classify these definitions from their exact launcher shape, never from server names such as `node_repl` or `computer-use`. Audit placement outside Codex or macOS without exposing environment or header values. Sync plans list incompatible bindings as skipped and never carry their launcher definition into an incompatible write; an ordinary same-name MCP remains a convergence candidate. Machine-generated app definitions are not cross-machine convergence candidates because app versions and trust metadata may differ: preserve each Mac's Codex-owned definition.
+
+Follow an exact Codex `agent-mcp-from-pi <server-name>` launcher to the matching Pi server for audit, provenance, and semantic comparison. Keep the Codex launcher's raw hash and Pi indirection beside the effective hash. Replace a proven-equal wrapper only when `--direct` is explicitly selected; the replacement uses the effective definition, never the wrapper command. Report a missing referenced Pi server with both config paths and the dependent Codex server.
+
+Report a launcher under another harness's `~/.agents/<harness>/...` directory as harness-coupled. Prefer a reviewed direct definition before convergence; do not infer arbitrary shell behavior.
+
+On Linux, audit absolute macOS paths under `/Users/<name>/...` and `/opt/homebrew/...` in MCP `command`, `args`, `cwd`, and environment values. Report the config file, server, field, and every wrapper-dependent harness; inspect the offending value locally rather than printing it. A `~` home reference is portable: preserve it in rendering and expand it only for local file access.
+
+Preserve secrets. Before writing a project file containing likely secret literals, prove the file is gitignored. Otherwise block apply. Never print secret values; report keys only.
+
+Compare normalized transport, command, arguments, working directory, URL, environment, headers, and enabled state within one scope. Skip identical definitions; different names and project/global variants are normal coexistence. A same-name semantic difference in the selected scope is a conflict. Choose a complete source or target variant, review a merge only when fields do not collide, or skip. The selected definition is applied only to the selected bindings.
+
+Every dry run emits a JSON plan with `apply: false` and `writes: []`. It contains paths, differing field names, and environment/header keys, never their values. A non-interactive unresolved conflict exits with code 2 and performs no writes. `--apply --confirmed` remains a separate write gate after the plan and conflict choices have been reviewed.
+
+Use `mcp --target <codex|claude|pi|grok|opencode|gemini|hermes|goose> --server <name>` to narrow a plan. Target eligibility follows the Harnesses section.
+
+Use repeated `mcp-remove --server <name> --target <harness> --scope project|global` flags to remove exact bindings. Scope is mandatory. The dry run lists every affected path, missing binding, and native renderer without secret values. Removal preserves unrelated servers and unknown fields, backs up every affected config and the provenance manifest, restores them on failure, and refreshes provenance after success.

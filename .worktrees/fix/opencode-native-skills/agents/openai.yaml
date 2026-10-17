@@ -1,0 +1,5 @@
+interface:
+  display_name: "Harness Sync"
+  short_description: "Sync skills and MCP configs across AI harnesses."
+  default_prompt: "Run /harness-sync to audit or synchronize skills and MCP configuration."
+
