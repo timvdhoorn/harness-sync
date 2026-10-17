@@ -1,0 +1,13 @@
+{
+  "name": "harness-sync",
+  "version": "0.1.0",
+  "description": "Audit and synchronize skills and MCP configuration across AI harnesses.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "harness-sync": "bun run scripts/harness-sync.ts",
+    "test": "bun test",
+    "check": "bun test && bun run scripts/harness-sync.ts audit --json"
+  }
+}
